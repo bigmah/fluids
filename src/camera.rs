@@ -1,6 +1,7 @@
 //! A minimal orbit camera: drag to turn, scroll to zoom.
 //!
-//! The fluid needs the right mouse button, so orbiting is on the left.
+//! Orbiting is on the right button, leaving the left one for the fluid so the
+//! mouse works the way it did in 2D.
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
@@ -68,7 +69,7 @@ fn orbit(
     let (orbit, transform) = &mut *camera;
     let mut moved = false;
 
-    if buttons.pressed(MouseButton::Left) && motion.delta != Vec2::ZERO {
+    if buttons.pressed(MouseButton::Right) && motion.delta != Vec2::ZERO {
         orbit.yaw -= motion.delta.x * ORBIT_SENSITIVITY;
         orbit.pitch =
             (orbit.pitch + motion.delta.y * ORBIT_SENSITIVITY).clamp(MIN_PITCH, MAX_PITCH);

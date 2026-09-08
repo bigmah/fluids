@@ -107,8 +107,24 @@ deep_color = [0.06, 0.25, 0.75]
 mid_color = [0.25, 0.72, 0.98]
 foam_color = [0.92, 0.98, 1.00]
 
+# Cap the frame rate to the display. Turn it off to see what a frame actually
+# costs: with it on, the title's ms/frame just reads your refresh interval.
+vsync = true
+
 [input]
 # Radius of the mouse's influence, in world units, and the velocity change per
 # second at its centre.
+#
+# A radial push in an incompressible fluid is mostly cancelled by the density
+# constraint -- only the free surface is free to move -- so the strength is far
+# larger than the speeds it produces. Measured, held at this radius:
+#
+#    4000 -> peak  604 u/s, surface lifts 13 units
+#   10000 -> peak  ~900 u/s
+#   30000 -> peak 1984 u/s
+#
+# Past about 1140 u/s a particle crosses more than a kernel radius per step and
+# outruns its own neighbour list, so shoving harder than that is self-defeating
+# unless you raise solver.substeps to match.
 mouse_radius = 110.0
-mouse_strength = 4000.0
+mouse_strength = 10000.0

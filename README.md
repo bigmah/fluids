@@ -21,13 +21,25 @@ argument: `cargo run --release -- big.toml`.
 
 | | |
 |---|---|
-| left drag | orbit the camera |
+| left mouse | push the water away from the cursor |
+| shift + left mouse | pull the water towards the cursor |
+| right drag | orbit the camera |
 | scroll | zoom |
-| right mouse | push the water away from the cursor |
-| shift + right mouse | pull the water towards the cursor |
 | space | pause / resume |
 | `R` | reset to the starting dam break |
 | `G` | flip gravity |
+
+The fluid is on the left button, as it was in the 2D version; the camera took
+the right one. A screen position names a ray rather than a point, so the push
+gets its depth from the fluid itself — it lands on the frontmost water under the
+cursor, which is what makes it feel direct rather than like pushing an invisible
+plane floating in the tank.
+
+Expect it to feel firmer than the 2D version did. A radial push in an
+incompressible fluid is mostly cancelled by the density constraint — only the
+free surface is really free to move — and in 3D there is more water in every
+direction to resist it. `input.mouse_strength` is the knob, and `config.toml`
+carries the measured response curve.
 
 The window title carries a live readout: particle count, how far the fluid is
 from incompressible, the bulk density, and the speed of the fastest particle.

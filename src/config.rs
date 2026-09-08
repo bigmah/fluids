@@ -117,6 +117,10 @@ pub struct Render {
     pub deep_color: [f32; 3],
     pub mid_color: [f32; 3],
     pub foam_color: [f32; 3],
+    /// Cap the frame rate to the display. Turn it off to see what the frame
+    /// actually costs -- with it on, the title's ms/frame reads the refresh
+    /// interval and tells you nothing about headroom.
+    pub vsync: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,6 +128,13 @@ pub struct Render {
 pub struct Input {
     pub mouse_radius: f32,
     /// Velocity change per second at the centre of the mouse's influence.
+    ///
+    /// A radial push in an incompressible fluid is mostly cancelled by the
+    /// density constraint -- only the free surface can actually move -- so this
+    /// is much larger than the speeds it produces. Measured: a held push at
+    /// 10000 peaks near 900 units/s. Pushing far past that is self-defeating,
+    /// since a particle crossing more than a kernel radius per step outruns its
+    /// own neighbour list; raise `solver.substeps` if you want a harder shove.
     pub mouse_strength: f32,
 }
 
@@ -174,6 +185,7 @@ impl Default for Render {
             deep_color: [0.06, 0.25, 0.75],
             mid_color: [0.25, 0.72, 0.98],
             foam_color: [0.92, 0.98, 1.00],
+            vsync: true,
         }
     }
 }
@@ -181,8 +193,8 @@ impl Default for Render {
 impl Default for Input {
     fn default() -> Self {
         Self {
-            mouse_radius: 130.0,
-            mouse_strength: 5200.0,
+            mouse_radius: 110.0,
+            mouse_strength: 10000.0,
         }
     }
 }

@@ -323,6 +323,37 @@ impl Fluid {
         self.neighbor_start.clear();
     }
 
+    /// The frontmost particle within `radius` of the ray, if any.
+    ///
+    /// A screen position names a ray, not a point, so an interaction in 3D has
+    /// to get its depth from somewhere. Taking it from the fluid itself is what
+    /// makes the mouse feel like the 2D version did: you push the water you are
+    /// pointing at, rather than whatever happens to lie on some reference
+    /// plane. Frontmost rather than nearest-to-the-ray, so pointing at a deep
+    /// pool pushes its surface instead of reaching through to the far side.
+    pub fn nearest_along_ray(&self, origin: Vec3, direction: Vec3, radius: f32) -> Option<Vec3> {
+        let dir = direction.normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return None;
+        }
+        let r2 = radius * radius;
+        self.pos
+            .par_iter()
+            .filter_map(|p| {
+                let rel = *p - origin;
+                let along = rel.dot(dir);
+                if along <= 0.0 {
+                    return None;
+                }
+                // Perpendicular distance to the ray, via Pythagoras on the
+                // component along it -- no square roots in the filter.
+                let perp2 = rel.length_squared() - along * along;
+                (perp2 < r2).then_some((along, *p))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, p)| p)
+    }
+
     /// Pushes particles within `radius` of `center` radially outwards, with a
     /// smooth falloff to zero at the rim. A negative `strength` pulls inwards.
     /// This is the mouse.
@@ -639,6 +670,8 @@ impl Fluid {
             })
             .collect();
         if samples.is_empty() {
+            // Too little water to have a bulk: every particle is within a
+            // kernel radius of a surface. Nothing to report rather than NaN.
             return f32::NAN;
         }
         samples.iter().sum::<f32>() / samples.len() as f32
@@ -808,6 +841,34 @@ mod tests {
     }
 
     #[test]
+    fn a_ray_finds_the_near_face_of_the_fluid() {
+        let mut fluid = Fluid::new(params());
+        fluid.fill_block(block());
+        let lo = fluid.pos.iter().copied().reduce(Vec3::min).unwrap();
+        let hi = fluid.pos.iter().copied().reduce(Vec3::max).unwrap();
+        let centre = (lo + hi) * 0.5;
+
+        // Fire at the block from well outside it, down the +x axis.
+        let origin = Vec3::new(lo.x - 500.0, centre.y, centre.z);
+        let hit = fluid
+            .nearest_along_ray(origin, Vec3::X, 30.0)
+            .expect("a ray through the middle of the block should hit it");
+        assert!(
+            (hit.x - lo.x).abs() < 3.0 * fluid.params.spacing,
+            "hit the far side at x={:.1}, near face is at {:.1}",
+            hit.x,
+            lo.x
+        );
+
+        // Aimed away from the fluid it should find nothing, rather than
+        // reporting the closest particle behind the camera.
+        assert!(fluid.nearest_along_ray(origin, -Vec3::X, 30.0).is_none());
+        // And a ray that passes wide misses.
+        let wide = Vec3::new(lo.x - 500.0, hi.y + 300.0, centre.z);
+        assert!(fluid.nearest_along_ray(wide, Vec3::X, 30.0).is_none());
+    }
+
+    #[test]
     fn radial_impulse_pushes_out_and_pulls_in() {
         let mut fluid = Fluid::new(params());
         fluid.fill_block(block());
@@ -951,6 +1012,61 @@ mod tests {
                 fluid.compression_error(),
                 if ms < 16.7 { "yes" } else { "no" }
             );
+        }
+    }
+
+    /// How hard the mouse has to push to visibly move the water. Ignored by
+    /// default; run with
+    /// `cargo test --release mouse_response -- --ignored --nocapture`.
+    ///
+    /// Measured headless because the windowed version cannot see the signal:
+    /// the pool is still sloshing from its own dam break at the point a hand
+    /// would reach for the mouse, and that swamps the push.
+    #[test]
+    #[ignore]
+    fn mouse_response() {
+        let mut settled = Fluid::new(params());
+        settled.fill_block(block());
+        for _ in 0..1200 {
+            settled.step(1.0 / 60.0);
+        }
+        let rest = settled.pos.clone();
+        println!("settled at peak {:.1} u/s", settled.max_speed());
+        println!("{:>10} {:>8}  {:>10} {:>10}", "strength", "radius", "peak", "surface_up");
+
+        for &radius in &[85.0f32, 110.0] {
+            for &strength in &[4_000.0f32, 12_000.0, 30_000.0, 60_000.0] {
+                let mut fluid = Fluid::new(params());
+                fluid.fill_block(block());
+                fluid.pos.copy_from_slice(&rest);
+                fluid.vel.iter_mut().for_each(|v| *v = Vec3::ZERO);
+
+                // Push just under the surface, in the middle of the pool,
+                // holding the button for a third of a second.
+                let b = fluid.params.bounds;
+                let top = fluid.pos.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+                let at = Vec3::new(0.0, top - fluid.params.spacing, 0.0);
+                let before = top;
+                let mut peak = 0.0f32;
+                for _ in 0..20 {
+                    fluid.apply_radial_impulse(at, radius, strength / 60.0);
+                    fluid.step(1.0 / 60.0);
+                    peak = peak.max(fluid.max_speed());
+                }
+                for _ in 0..20 {
+                    fluid.step(1.0 / 60.0);
+                    peak = peak.max(fluid.max_speed());
+                }
+                let after = fluid.pos.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+                println!(
+                    "{:>10.0} {:>8.0}  {:>10.1} {:>10.1}",
+                    strength,
+                    radius,
+                    peak,
+                    after - before
+                );
+                let _ = b;
+            }
         }
     }
 

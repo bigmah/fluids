@@ -3,11 +3,11 @@
 //! Everything tunable lives in `config.toml`; see `config.rs` for the fields
 //! and their defaults. Pass a different path as the first argument.
 //!
-//! Controls:
-//!   left drag     orbit the camera
+//! Controls, with the fluid on the left button as it was in 2D:
+//!   left mouse    push the water away from the cursor
+//!   shift + left  pull the water towards the cursor
+//!   right drag    orbit the camera
 //!   scroll        zoom
-//!   right mouse   push the water away from the cursor
-//!   shift + right pull the water towards the cursor
 //!   space         pause / resume
 //!   R             reset to the starting dam break
 //!   G             flip gravity
@@ -18,7 +18,7 @@ mod render;
 mod sim;
 
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
+use bevy::window::{PresentMode, PrimaryWindow};
 
 use camera::{OrbitCamera, OrbitCameraPlugin};
 use config::Config;
@@ -30,6 +30,27 @@ const SIM_HZ: f64 = 60.0;
 
 #[derive(Resource, Default)]
 struct Paused(bool);
+
+/// Exponentially smoothed frame and solver timings, for the title readout.
+///
+/// Worth carrying because the two answer different questions: the solver time
+/// is what a GPU port would attack, and the gap between it and the frame time
+/// is what a GPU port would leave untouched.
+#[derive(Resource, Default)]
+struct Timings {
+    frame_ms: f32,
+    solver_ms: f32,
+}
+
+impl Timings {
+    fn feed(slot: &mut f32, sample: f32) {
+        *slot = if *slot == 0.0 {
+            sample
+        } else {
+            *slot * 0.9 + sample * 0.1
+        };
+    }
+}
 
 /// Throttles the window-title readout. Recomputing the compression error costs
 /// a full neighbourhood pass, so it is not something to do every frame.
@@ -75,6 +96,11 @@ fn main() {
             primary_window: Some(Window {
                 title: "Fluids".into(),
                 resolution: (1280, 800).into(),
+                present_mode: if config.render.vsync {
+                    PresentMode::AutoVsync
+                } else {
+                    PresentMode::AutoNoVsync
+                },
                 // Without this the window can open on whichever monitor the WM
                 // feels like, including off-screen.
                 position: WindowPosition::Centered(MonitorSelection::Primary),
@@ -87,6 +113,7 @@ fn main() {
         .insert_resource(fluid)
         .init_resource::<Paused>()
         .init_resource::<HudTimer>()
+        .init_resource::<Timings>()
         .add_plugins((OrbitCameraPlugin, FluidRenderPlugin))
         .add_systems(FixedUpdate, step_fluid.run_if(running))
         .add_systems(
@@ -100,9 +127,11 @@ fn running(paused: Res<Paused>) -> bool {
     !paused.0
 }
 
-fn step_fluid(mut fluid: ResMut<Fluid>, time: Res<Time<Fixed>>) {
+fn step_fluid(mut fluid: ResMut<Fluid>, time: Res<Time<Fixed>>, mut timings: ResMut<Timings>) {
     let dt = time.delta_secs();
+    let start = std::time::Instant::now();
     fluid.step(dt);
+    Timings::feed(&mut timings.solver_ms, start.elapsed().as_secs_f32() * 1000.0);
 }
 
 fn handle_keys(
@@ -122,12 +151,12 @@ fn handle_keys(
     }
 }
 
-/// Pushes or pulls the water at the cursor.
+/// Pushes or pulls the water at the cursor, on the left button as in 2D.
 ///
-/// A screen position names a ray, not a point, so the depth has to come from
-/// somewhere. It is taken from the plane through the camera's focus point
-/// facing the camera, which is the reading that matches what the cursor looks
-/// like it is over.
+/// The depth comes from the fluid: the impulse lands on the frontmost water
+/// under the cursor. Falling back to a plane through the camera's focus point
+/// keeps a drag going when the cursor slides off the water mid-stroke, instead
+/// of the push cutting out.
 fn handle_mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -137,7 +166,7 @@ fn handle_mouse(
     time: Res<Time>,
     mut fluid: ResMut<Fluid>,
 ) {
-    if !buttons.pressed(MouseButton::Right) {
+    if !buttons.pressed(MouseButton::Left) {
         return;
     }
     let Some(cursor) = window.cursor_position() else {
@@ -148,13 +177,17 @@ fn handle_mouse(
         return;
     };
 
-    // The plane the camera is already focused on, so the push lands where the
-    // cursor looks like it is pointing.
-    let plane = InfinitePlane3d::new(camera_transform.forward());
-    let Some(distance) = ray.intersect_plane(orbit.target, plane) else {
-        return;
+    let reach = config.input.mouse_radius;
+    let point = match fluid.nearest_along_ray(ray.origin, *ray.direction, reach) {
+        Some(hit) => hit,
+        None => {
+            let plane = InfinitePlane3d::new(camera_transform.forward());
+            let Some(distance) = ray.intersect_plane(orbit.target, plane) else {
+                return;
+            };
+            ray.get_point(distance)
+        }
     };
-    let point = ray.get_point(distance);
 
     let pull = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     // Scaled by frame time so the push feels the same regardless of frame rate.
@@ -168,19 +201,31 @@ fn update_title(
     fluid: Res<Fluid>,
     paused: Res<Paused>,
     time: Res<Time>,
+    real: Res<Time<Real>>,
+    mut timings: ResMut<Timings>,
     mut timer: ResMut<HudTimer>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
 ) {
+    Timings::feed(&mut timings.frame_ms, real.delta_secs() * 1000.0);
     if !timer.0.tick(time.delta()).just_finished() {
         return;
     }
+    // Counted geometrically rather than read off the SPH estimate, which is
+    // truncated near every surface. 100% is a fluid at rest density; a pool too
+    // thin to have a bulk has nothing to report.
+    let bulk = fluid.interior_density_ratio();
+    let bulk = if bulk.is_finite() {
+        format!("{:.0}%", bulk * 100.0)
+    } else {
+        "n/a".to_string()
+    };
     window.title = format!(
-        "Fluids - {} particles - compression {:.1}% - bulk {:.0}% - peak {:.0} u/s{}",
+        "Fluids - {} particles - {:.1} ms/frame ({:.1} solver) - compression {:.1}% \
+         - bulk {bulk} - peak {:.0} u/s{}",
         fluid.len(),
+        timings.frame_ms,
+        timings.solver_ms,
         fluid.compression_error() * 100.0,
-        // Counted geometrically rather than read off the SPH estimate, which
-        // is truncated near every surface. 100% is a fluid at rest density.
-        fluid.interior_density_ratio() * 100.0,
         fluid.max_speed(),
         if paused.0 { " - PAUSED" } else { "" },
     );
