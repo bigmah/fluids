@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["bevy_winit", "bevy_sprite", "bevy_core_pipeline", "bevy_asset", "bevy_log", "bevy_window", "multi_threaded", "std", "bevy_sprite_render", "png"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 
 # Bevy is unusably slow in an unoptimised build, but optimising our own crate
 # too would make edit-compile-run slow. Optimise the dependencies hard, this

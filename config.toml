@@ -1,0 +1,101 @@
+# Everything tunable in the simulation. Every field is optional -- delete any
+# line to get the default back, or delete the whole file to get all of them.
+# Unknown or out-of-range fields are refused at startup rather than ignored.
+#
+# Pass a different file as the first argument: `cargo run --release -- big.toml`
+
+[world]
+# The simulation box, in world units. The window is sized to match.
+width = 1240.0
+height = 760.0
+# Units per second squared. The box is `height` units tall, so if you change
+# the box, scale this with it to keep the fluid looking the same weight.
+gravity = [0.0, -1400.0]
+
+[fluid]
+# HOW MUCH WATER. The block starts in the lower-left corner and collapses, so
+# more of it means a deeper pool. This is usually the knob you want.
+#
+# Measured on an M4 Pro, at the spacing below:
+#     61x37   =  2257 particles   2.6 ms/step   60fps
+#     86x52   =  4472 particles   5.3 ms/step   60fps
+#    104x63   =  6552 particles   7.9 ms/step   60fps
+#    123x75   =  9225 particles  20.9 ms/step   needs substeps, misses 60fps
+#
+# 123x75 is the whole box at this spacing; the startup check will tell you the
+# maximum if you overshoot. Note the jump at the end: a taller block falls
+# further and so lands faster, which forces solver.substeps up (see below).
+columns = 78
+rows = 60
+
+# RESOLUTION. Rest distance between neighbouring particles. Halving this packs
+# four times as many particles into the same water. It is the more expensive
+# knob, and it does not stand alone -- see the two notes below.
+spacing = 10.0
+
+# How far a particle looks for neighbours. What matters is the RATIO to
+# `spacing`, which sets the neighbour count and with it the solver's whole
+# calibration, so change the two together and keep this at about 2.4x spacing.
+smoothing_radius = 24.0
+
+[solver]
+# Solver steps per frame. The one to raise when you lower `spacing` or raise
+# `rows`: peak speed comes from gravity and drop height, not from resolution,
+# so a smaller kernel means a particle covers more of it per step. Let it get
+# too low and the fluid explodes -- so the startup check refuses the
+# combination and tells you what to set this to.
+substeps = 1
+
+# Jacobi iterations per substep. Drives compression down roughly linearly at a
+# matching cost. Do NOT trade these away for substeps: Jacobi carries pressure
+# about one particle per iteration, so a finer grid makes the pool deeper in
+# particles and needs MORE passes, not fewer. Measured: at spacing 5, dropping
+# to 6 iterations to pay for a second substep explodes to 7.7e6 units/s.
+iterations = 12
+
+# Under-relaxation on the positional correction. Jacobi updates every particle
+# against stale neighbours, so applying the full correction overshoots and the
+# fluid detonates. Measured: 0.6 diverges at some iteration counts, so this is
+# a ceiling rather than a starting point, and values above 0.55 are refused.
+jacobi_relax = 0.5
+
+# Constraint force mixing, as a fraction of the lattice gradient reference.
+# Softens the constraint so free-surface particles don't get huge multipliers.
+relaxation = 0.05
+
+# XSPH viscosity. 0 is inviscid and jittery; ~0.1 reads as water; higher is
+# syrup.
+viscosity = 0.08
+
+# Artificial pressure, which counteracts the clumping the density constraint
+# causes at the free surface. Raising `tensile_k` also reads as surface tension.
+tensile_k = 0.04
+tensile_q = 0.2
+tensile_n = 4
+
+# Fraction of tangential velocity kept when a particle hits a wall. 1.0 is
+# frictionless, 0.0 makes walls sticky.
+wall_friction = 0.98
+
+[render]
+# Sprite diameter as a multiple of `spacing`. Below about 2.0 neighbouring
+# particles stop overlapping and the fluid reads as a dot screen rather than a
+# body of water. Above about 3.0 it turns into a blob.
+particle_scale = 2.4
+
+# Speed at which a particle is drawn as full white foam. Lower it for more
+# foam. For reference, a settled pool sits near 60 units/s and a breaking wave
+# peaks around 1200.
+foam_speed = 900.0
+
+# Linear RGB, 0..1. The gradient runs deep -> mid -> foam with speed.
+background = [0.05, 0.06, 0.10]
+deep_color = [0.06, 0.25, 0.75]
+mid_color = [0.25, 0.72, 0.98]
+foam_color = [0.92, 0.98, 1.00]
+
+[input]
+# Radius of the mouse's influence, in world units, and the velocity change per
+# second at its centre.
+mouse_radius = 130.0
+mouse_strength = 5200.0

@@ -9,22 +9,19 @@ use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
+use crate::config::Config;
 use crate::sim::Fluid;
 
 /// Links a sprite back to its index in the solver's arrays.
 #[derive(Component)]
 pub struct ParticleIndex(pub usize);
 
-/// Speed at which a particle is drawn as full foam. Tuned against the solver's
-/// measured behaviour: a settled pool sits near 60 units/s and a breaking wave
-/// peaks around 1200.
-const FOAM_SPEED: f32 = 900.0;
-
 pub struct FluidRenderPlugin;
 
 impl Plugin for FluidRenderPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.10)))
+        let bg = app.world().resource::<Config>().render.background;
+        app.insert_resource(ClearColor(Color::srgb(bg[0], bg[1], bg[2])))
             .add_systems(Startup, spawn_particles)
             // Runs in Update, not FixedUpdate: the solver ticks at a fixed 60 Hz
             // but the sprites should follow the latest state at whatever rate
@@ -37,7 +34,7 @@ fn spawn_particles(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     fluid: Res<Fluid>,
-    params: Res<crate::sim::FluidParams>,
+    config: Res<Config>,
 ) {
     commands.spawn(Camera2d);
 
@@ -45,7 +42,7 @@ fn spawn_particles(
     // Drawn well over the rest spacing. The opaque core has to be more than
     // half a spacing in radius or neighbouring particles leave visible gaps and
     // the fluid reads as a dot screen instead of a body of water.
-    let diameter = params.spacing * 2.4;
+    let diameter = config.fluid.spacing * config.render.particle_scale;
 
     for i in 0..fluid.len() {
         commands.spawn((
@@ -95,29 +92,30 @@ fn circle_texture(images: &mut Assets<Image>, size: u32) -> Handle<Image> {
 }
 
 /// Deep blue at rest, through cyan, to white foam at speed.
-fn speed_color(speed: f32) -> Color {
+fn speed_color(speed: f32, palette: &crate::config::Render) -> Color {
     // Square root, so the slow end of the range -- where most of the fluid
     // lives -- still shows variation instead of flattening to one blue.
-    let t = (speed / FOAM_SPEED).clamp(0.0, 1.0).sqrt();
-    const DEEP: Vec3 = Vec3::new(0.06, 0.25, 0.75);
-    const MID: Vec3 = Vec3::new(0.25, 0.72, 0.98);
-    const FOAM: Vec3 = Vec3::new(0.92, 0.98, 1.00);
+    let t = (speed / palette.foam_speed).clamp(0.0, 1.0).sqrt();
+    let deep = Vec3::from(palette.deep_color);
+    let mid = Vec3::from(palette.mid_color);
+    let foam = Vec3::from(palette.foam_color);
     let c = if t < 0.5 {
-        DEEP.lerp(MID, t * 2.0)
+        deep.lerp(mid, t * 2.0)
     } else {
-        MID.lerp(FOAM, (t - 0.5) * 2.0)
+        mid.lerp(foam, (t - 0.5) * 2.0)
     };
     Color::srgb(c.x, c.y, c.z)
 }
 
 fn sync_particles(
     fluid: Res<Fluid>,
+    config: Res<Config>,
     mut particles: Query<(&ParticleIndex, &mut Transform, &mut Sprite)>,
 ) {
     for (index, mut transform, mut sprite) in &mut particles {
         let i = index.0;
         transform.translation.x = fluid.pos[i].x;
         transform.translation.y = fluid.pos[i].y;
-        sprite.color = speed_color(fluid.vel[i].length());
+        sprite.color = speed_color(fluid.vel[i].length(), &config.render);
     }
 }

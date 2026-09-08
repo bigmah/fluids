@@ -66,9 +66,17 @@ pub struct FluidParams {
     /// Rest spacing of the initial lattice. Sets how many neighbours a particle
     /// sees, and calibrates the rest density.
     pub spacing: f32,
-    /// Jacobi iterations per step. More iterations drive the compression down
-    /// roughly linearly, at a matching cost: see the `sweep` test.
+    /// Jacobi iterations per substep. More iterations drive the compression
+    /// down roughly linearly, at a matching cost: see the `sweep` test.
     pub iterations: u32,
+    /// Solver steps per frame. Each one re-predicts positions and rebuilds
+    /// neighbourhoods, so this is the knob that keeps the fastest particle from
+    /// crossing a kernel radius in a single step. It is what a finer `spacing`
+    /// needs: peak speed is set by gravity and box height, not by resolution,
+    /// so halving the kernel radius doubles the distance travelled per step
+    /// measured in kernel radii. Above 1 the neighbour lists stop describing
+    /// reality and the fluid explodes.
+    pub substeps: u32,
     /// Constraint force mixing, as a fraction of the lattice gradient reference.
     /// Softens the constraint so surface particles don't get huge multipliers.
     pub relaxation: f32,
@@ -93,32 +101,6 @@ pub struct FluidParams {
     pub wall_friction: f32,
     pub bounds: Rect,
 }
-
-impl Default for FluidParams {
-    fn default() -> Self {
-        Self {
-            smoothing_radius: 24.0,
-            spacing: 10.0,
-            iterations: 12,
-            relaxation: 0.05,
-            viscosity: 0.08,
-            tensile_k: 0.04,
-            tensile_q: 0.2,
-            tensile_n: 4,
-            gravity: Vec2::new(0.0, -1400.0),
-            jacobi_relax: 0.5,
-            wall_friction: 0.98,
-            bounds: Rect {
-                min: Vec2::new(-620.0, -380.0),
-                max: Vec2::new(620.0, 380.0),
-            },
-        }
-    }
-}
-
-/// Particles across and up in the starting block. Shared with the tests so they
-/// exercise the configuration that actually ships.
-pub const START_BLOCK: (usize, usize) = (78, 60);
 
 /// Uniform grid over the simulation bounds, rebuilt each step by counting sort.
 /// The bounds are fixed and the cell size is the kernel radius, so a dense grid
@@ -284,12 +266,19 @@ impl Fluid {
         }
     }
 
-    /// Advances the fluid by `dt` seconds.
+    /// Advances the fluid by `dt` seconds, in `params.substeps` equal steps.
     pub fn step(&mut self, dt: f32) {
         if self.pos.is_empty() || dt <= 0.0 {
             return;
         }
+        let substeps = self.params.substeps.max(1);
+        let sub_dt = dt / substeps as f32;
+        for _ in 0..substeps {
+            self.substep(sub_dt);
+        }
+    }
 
+    fn substep(&mut self, dt: f32) {
         // 1. Apply external forces and predict where particles want to be.
         for i in 0..self.pos.len() {
             self.vel[i] += self.params.gravity * dt;
@@ -494,10 +483,22 @@ fn lattice_reference(kernels: &Kernels, spacing: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+
+    /// The tuned defaults, so the tests exercise the configuration that ships.
+    fn params() -> FluidParams {
+        Config::default().fluid_params()
+    }
+
+    fn block() -> (usize, usize) {
+        let c = Config::default();
+        (c.fluid.columns, c.fluid.rows)
+    }
 
     fn settled(steps: u32) -> Fluid {
-        let mut fluid = Fluid::new(FluidParams::default());
-        fluid.fill_block(START_BLOCK.0, START_BLOCK.1);
+        let mut fluid = Fluid::new(params());
+        let (cols, rows) = block();
+        fluid.fill_block(cols, rows);
         for _ in 0..steps {
             fluid.step(1.0 / 60.0);
         }
@@ -506,9 +507,9 @@ mod tests {
 
     #[test]
     fn rest_density_matches_the_seed_lattice() {
-        let params = FluidParams::default();
-        let mut fluid = Fluid::new(params);
-        fluid.fill_block(START_BLOCK.0, START_BLOCK.1);
+        let mut fluid = Fluid::new(params());
+        let (cols, rows) = block();
+        fluid.fill_block(cols, rows);
         // One step just to populate neighbour lists; the lattice has not had
         // time to move, so the interior should already sit at rest density.
         fluid.step(1.0 / 600.0);
@@ -555,8 +556,9 @@ mod tests {
 
     #[test]
     fn radial_impulse_pushes_out_and_pulls_in() {
-        let mut fluid = Fluid::new(FluidParams::default());
-        fluid.fill_block(START_BLOCK.0, START_BLOCK.1);
+        let mut fluid = Fluid::new(params());
+        let (cols, rows) = block();
+        fluid.fill_block(cols, rows);
         let center = fluid.pos[fluid.len() / 2];
 
         // A particle offset from the centre should be pushed directly away.
@@ -628,14 +630,15 @@ mod tests {
         for &relax in &[0.4f32, 0.5, 0.6] {
             for &tens in &[0.04f32] {
                 for &iters in &[8u32, 10, 12, 16] {
-                    let params = FluidParams {
+                    let sweep_params = FluidParams {
                         jacobi_relax: relax,
                         tensile_k: tens,
                         iterations: iters,
-                        ..Default::default()
+                        ..params()
                     };
-                    let mut fluid = Fluid::new(params);
-                    fluid.fill_block(START_BLOCK.0, START_BLOCK.1);
+                    let mut fluid = Fluid::new(sweep_params);
+                    let (cols, rows) = block();
+                    fluid.fill_block(cols, rows);
 
                     // Where the pool surface should end up if the fluid keeps
                     // its rest volume and spreads across the full floor.
@@ -689,14 +692,99 @@ mod tests {
         }
     }
 
+    /// How the per-step cost scales, along the two different axes that the
+    /// particle count can be raised on. Ignored by default; run with
+    /// `cargo test --release scaling -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn scaling() {
+        fn measure(config: &Config) -> (f32, f32, f32) {
+            let mut fluid = Fluid::new(config.fluid_params());
+            fluid.fill_block(config.fluid.columns, config.fluid.rows);
+            // Warm up past the initial collapse, where the fluid is at its
+            // densest and the neighbour lists are longest.
+            for _ in 0..120 {
+                fluid.step(1.0 / 60.0);
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..200 {
+                fluid.step(1.0 / 60.0);
+            }
+            let ms = start.elapsed().as_secs_f32() * 1000.0 / 200.0;
+            (ms, fluid.compression_error(), fluid.max_speed())
+        }
+
+        // Axis 1: more water at the shipped resolution. Nothing else has to
+        // change, and the ceiling is simply the box being full.
+        println!("more water, spacing {}:", Config::default().fluid.spacing);
+        println!(
+            "{:>10} {:>10} {:>10} {:>5} {:>10} {:>8}",
+            "block", "particles", "ms/step", "sub", "compress", "60Hz?"
+        );
+        let (max_cols, max_rows) = Config::default().max_block();
+        for fraction in [0.5f32, 0.7, 0.85, 1.0] {
+            let mut config = Config::default();
+            config.fluid.columns = (max_cols as f32 * fraction) as usize;
+            config.fluid.rows = (max_rows as f32 * fraction) as usize;
+            // A taller starting block falls further and so lands faster, which
+            // is its own reason to substep -- nothing to do with resolution.
+            config.solver.substeps = config.required_substeps();
+            config.validate().expect("config should be valid");
+            let (ms, compress, _) = measure(&config);
+            println!(
+                "{:>10} {:>10} {:>10.2} {:>5} {:>10.4} {:>8}",
+                format!("{}x{}", config.fluid.columns, config.fluid.rows),
+                config.fluid.columns * config.fluid.rows,
+                ms,
+                config.solver.substeps,
+                compress,
+                if ms < 16.7 { "yes" } else { "no" }
+            );
+        }
+
+        // Axis 2: the same water, resolved more finely. Costs substeps as well
+        // as particles, because peak speed does not fall with the kernel.
+        println!("\nfiner resolution, same volume of water:");
+        println!(
+            "{:>8} {:>10} {:>10} {:>9} {:>10} {:>10} {:>8}",
+            "spacing", "particles", "ms/step", "sub x it", "compress", "max_speed", "60Hz?"
+        );
+        for spacing in [14.0f32, 12.0, 10.0, 8.0, 6.5, 5.0, 4.0] {
+            let mut config = Config::default();
+            config.fluid.spacing = spacing;
+            config.fluid.smoothing_radius = spacing * 2.4;
+            let (max_cols, max_rows) = config.max_block();
+            config.fluid.columns = (max_cols as f32 * 0.63) as usize;
+            config.fluid.rows = (max_rows as f32 * 0.8) as usize;
+            // Take the solver's own advice, which is what the config error
+            // tells a user to do. Iterations stay put: they cannot be traded
+            // away for substeps, because a finer grid makes the pool deeper in
+            // particles and Jacobi needs the passes to carry pressure up it.
+            config.solver.substeps = config.required_substeps();
+            config.validate().expect("config should be valid");
+            let (ms, compress, peak) = measure(&config);
+            println!(
+                "{:>8.1} {:>10} {:>10.2} {:>9} {:>10.4} {:>10.1} {:>8}",
+                spacing,
+                config.fluid.columns * config.fluid.rows,
+                ms,
+                format!("{}x{}", config.solver.substeps, config.solver.iterations),
+                compress,
+                peak,
+                if ms < 16.7 { "yes" } else { "no" }
+            );
+        }
+    }
+
     /// Diagnostic trace, plus the per-step cost at the shipped particle count.
     /// Ignored by default; run with
     /// `cargo test --release report -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn report() {
-        let mut fluid = Fluid::new(FluidParams::default());
-        fluid.fill_block(START_BLOCK.0, START_BLOCK.1);
+        let mut fluid = Fluid::new(params());
+        let (cols, rows) = block();
+        fluid.fill_block(cols, rows);
         println!(
             "particles={} rest_density={:.6}",
             fluid.len(),

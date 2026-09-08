@@ -1,5 +1,8 @@
 //! A 2D water simulation: Position Based Fluids, drawn with Bevy sprites.
 //!
+//! Everything tunable lives in `config.toml`; see `config.rs` for the fields
+//! and their defaults. Pass a different path as the first argument.
+//!
 //! Controls:
 //!   left mouse   push the water away from the cursor
 //!   right mouse  pull the water towards the cursor
@@ -7,22 +10,19 @@
 //!   R            reset to the starting dam break
 //!   G            flip gravity
 
+mod config;
 mod render;
 mod sim;
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
+use config::Config;
 use render::FluidRenderPlugin;
-use sim::{Fluid, FluidParams, START_BLOCK};
+use sim::Fluid;
 
 /// Solver rate. The solver is stable here; see the tests in `sim`.
 const SIM_HZ: f64 = 60.0;
-
-/// Radius of the mouse's influence, in world units.
-const MOUSE_RADIUS: f32 = 130.0;
-/// Velocity change applied at the centre of the mouse's influence, per second.
-const MOUSE_STRENGTH: f32 = 5200.0;
 
 #[derive(Resource, Default)]
 struct Paused(bool);
@@ -39,11 +39,30 @@ impl Default for HudTimer {
 }
 
 fn main() {
-    let params = FluidParams::default();
-    let window_size = params.bounds.size();
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| config::DEFAULT_PATH.to_string());
 
-    let mut fluid = Fluid::new(params);
-    fluid.fill_block(START_BLOCK.0, START_BLOCK.1);
+    // A bad config is worth a clean message on stderr rather than a panic
+    // backtrace: this file is meant to be edited by hand.
+    let config = match Config::load(&path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let window_size = config.bounds().size();
+    let mut fluid = Fluid::new(config.fluid_params());
+    fluid.fill_block(config.fluid.columns, config.fluid.rows);
+    println!(
+        "{} particles, {}x{} world, {} solver iterations",
+        fluid.len(),
+        config.world.width,
+        config.world.height,
+        config.solver.iterations
+    );
 
     App::new()
         .add_plugins(
@@ -65,7 +84,7 @@ fn main() {
                 .set(ImagePlugin::default_linear()),
         )
         .insert_resource(Time::<Fixed>::from_hz(SIM_HZ))
-        .insert_resource(params)
+        .insert_resource(config)
         .insert_resource(fluid)
         .init_resource::<Paused>()
         .init_resource::<HudTimer>()
@@ -89,6 +108,7 @@ fn step_fluid(mut fluid: ResMut<Fluid>, time: Res<Time<Fixed>>) {
 
 fn handle_keys(
     keys: Res<ButtonInput<KeyCode>>,
+    config: Res<Config>,
     mut fluid: ResMut<Fluid>,
     mut paused: ResMut<Paused>,
 ) {
@@ -96,7 +116,7 @@ fn handle_keys(
         paused.0 = !paused.0;
     }
     if keys.just_pressed(KeyCode::KeyR) {
-        fluid.fill_block(START_BLOCK.0, START_BLOCK.1);
+        fluid.fill_block(config.fluid.columns, config.fluid.rows);
     }
     if keys.just_pressed(KeyCode::KeyG) {
         fluid.params.gravity = -fluid.params.gravity;
@@ -107,6 +127,7 @@ fn handle_mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<Camera2d>>,
+    config: Res<Config>,
     time: Res<Time>,
     mut fluid: ResMut<Fluid>,
 ) {
@@ -125,8 +146,8 @@ fn handle_mouse(
     };
 
     // Scaled by frame time so the push feels the same regardless of frame rate.
-    let strength = MOUSE_STRENGTH * time.delta_secs() * if push { 1.0 } else { -1.0 };
-    fluid.apply_radial_impulse(world, MOUSE_RADIUS, strength);
+    let strength = config.input.mouse_strength * time.delta_secs() * if push { 1.0 } else { -1.0 };
+    fluid.apply_radial_impulse(world, config.input.mouse_radius, strength);
 }
 
 /// Reports the live state of the solver in the window title: how far the fluid
