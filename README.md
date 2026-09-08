@@ -1,28 +1,60 @@
 # fluids
 
-A 3D particle water simulation in Rust and [Bevy](https://bevyengine.org), with a
-continuous water surface and a plunging, thick-lipped barrel study.
+A 3D particle water simulation in Rust and [Bevy](https://bevyengine.org), with
+configurable offshore swell, a submerged reef, and a continuous water surface.
 
-![The simulated barrel, 0.12 seconds after release](docs/barrel.png)
-
-The default scene releases a pitching crest over a reef shelf. The lip has real
-thickness and the barrel contains air; the particle solver drives the collapse,
-impact, and wash. Playback starts at quarter speed and replays automatically.
+The default scene starts with flat water. An offshore generation zone introduces
+a regular swell, which travels into shallower water and interacts with a steep
+reef shelf. The particle solver determines the wave face, overturning, impact,
+and wash. The reef mesh and collisions use the same bathymetry.
 
 ```
 cargo run --release
 ```
 
-For the original dam break with the new surface renderer:
+Set the incoming swell in [`config.toml`](config.toml), then restart the app:
+
+```toml
+[swell]
+direction = 0.0  # direction of travel: +X toward the reef; positive turns toward +Z
+height = 40.0    # offshore crest-to-trough height, in world units
+period = 1.8     # simulation seconds between crests
+```
+
+The old `wave.height`, `speed`, `curl`, `lip_thickness`, and `peel` controls have
+been removed; use `[swell]` and the reef geometry instead.
+
+Direction supports **-60 to +60 degrees**, relative to +X; it is a travel angle,
+not a compass bearing or a meteorological “coming from” direction. The reef stays
+fixed. Changing the angle changes the incoming orbital velocities and the phase
+along the crest. Height is the generator's target offshore height, not the final
+breaking height. `height = 0` gives still water with the same reef.
+
+The wavemaker solves `ω² = g k tanh(k h)` for wavelength, then relaxes offshore
+particle velocities toward the corresponding finite-depth orbital motion. Its
+strength fades to zero before the reef. This follows the
+[wave relaxation zone approach](https://github.com/DualSPHysics/DualSPHysics/wiki/3.-SPH-formulation#3132-relaxation-zone-rz).
+There is no prescribed crest, curl, or lip trajectory. A damping beach beyond
+the reef reduces returning wash; particles remain in the tank.
+
+The water settles for one period and the generator ramps up over two more.
+Allow roughly 10–15 simulated seconds for the shipped swell to reach the shelf.
+Playback starts at normal speed with automatic replay disabled; `S` slows the
+simulation for inspection and `R` restarts it.
+
+Lengths use the same arbitrary world units as the original solver, and period
+uses simulation seconds. The shipped gravity is 700 units/s². Longer periods
+need a deeper and wider offshore region: validation requires at least half a
+wavelength of water depth, resolved wave height/wavelength, and space between
+the generation zone, reef, and damping beach. For a meter-based setup, set
+`world.gravity = [0, -9.81, 0]` and choose all lengths, particle spacing, and input
+settings consistently. Playback speed does not change the physical period.
+
+For the original dam break:
 
 ```
 cargo run --release -- dam-break.toml
 ```
-
-This is an initialized barrel study, **not yet a simulation of offshore swell
-shoaling and breaking at Pipeline**. The crest starts in a shaped configuration
-with an initial velocity field. Nothing animates or holds its shape after release.
-The reef is a smooth, approximate shelf, not measured Pipeline bathymetry.
 
 ## Water appearance and wave shape
 
@@ -43,12 +75,15 @@ Useful settings in `config.toml`:
 
 | Setting | Effect |
 |---|---|
-| `wave.height` | Crest height above the pool |
-| `wave.lip_thickness` | Lip thickness as a fraction of height; keep at least two particle layers |
-| `wave.curl` | How far the lip has pitched at release, in radians |
-| `wave.peel` | Curl variation along the crest |
-| `wave.speed` | Initial crest velocity |
-| `wave.reef_height` | Rise of the collision shelf |
+| `swell.direction` | Incoming travel angle relative to +X, in degrees |
+| `swell.height` | Target offshore crest-to-trough height |
+| `swell.period` | Time between crests; also sets wavelength and orbital speed |
+| `wave.water_depth` | Still-water depth offshore |
+| `wave.reef_height` | Bed rise; water above the shelf is `water_depth - reef_height` |
+| `wave.reef_start` | Start of the bed rise, as a fraction of tank width |
+| `wave.reef_width` | Length of the bed rise, as a fraction of tank width |
+| `wave.reef_skew` | Change in reef X per unit Z; affects where the wave breaks along the shelf |
+| `wave.beach_width` | Fraction of tank width used to damp shoreward wash |
 | `scene.time_scale` | Playback speed, without changing the physics timestep |
 | `scene.replay_after` | Replay interval in simulated seconds; `0` disables it |
 | `render.surface_resolution` | Mesh voxel size / particle spacing; smaller costs more CPU |
@@ -203,19 +238,24 @@ deeper *in particles* and needs more passes, not fewer.
 
 ![the pool settled](docs/settled.png)
 
-**No offshore wavemaker or air phase yet.** The barrel preset is an initial
-condition. Predicting a breaking wave from incoming swell will need a wavemaker,
-absorbing boundaries, calibrated reef geometry, and finer fluid resolution.
-Entrained air and bubble dynamics are outside this single-phase solver.
+**An approximate single-phase wave tank.** Breaking develops from the particle
+motion and reef interaction. A clean hollow slab is sensitive to swell steepness,
+reef slope, water depth, and resolution; the model is not calibrated against
+measured surf breaks. The prescribed height and direction are input targets,
+not measured guarantees at the reef. Numerical dissipation and finite tank walls
+still affect the arriving swell, especially at large angles. The damping beach
+reduces reflections but is not a perfect open boundary. Entrained air and bubble
+pressure are outside this solver. Thin lips need several particle layers to
+survive reconstruction, so finer spacing costs substantially more CPU time.
 
-**Walls have no boundary particles.** A hard wall truncates the smoothing kernel
-the same way a free surface does, so the layer of particles resting on the floor
-reads as under-dense and the solver packs it about 50% too tightly. The bulk of
-the fluid holds rest density to within about 2% (`the_bulk_holds_its_rest_density`
-asserts this by counting particles in a ball rather than trusting the SPH
-estimate, which is truncated near every surface), but the settled pool sits
-around 10% shallower than its rest volume implies. The fix is boundary particles
-or a wall density correction, not a change to the solver.
+**Approximate solid support in the wave scene.** The density constraint includes
+an analytical estimate of kernel volume inside the reef and tank walls, using
+local tangent planes. Reef collisions project along the bed normal so a steep
+slope does not turn horizontal corrections into artificial upward jets. This
+improves water-level retention but does not constitute an exact boundary-particle
+model, especially at corners and rapidly changing bed slopes. The original dam
+break retains its previous boundary behavior: its settled pool is roughly 10%
+shallower than its rest volume implies.
 
 ## Layout
 
@@ -223,7 +263,7 @@ or a wall density correction, not a change to the solver.
 |---|---|
 | `src/sim.rs` | the solver — no rendering, no ECS in the hot path |
 | `src/config.rs` | the `config.toml` format, its defaults, and validation |
-| `src/wave.rs` | pitching-crest initial conditions and shared reef geometry |
+| `src/wave.rs` | directional swell generation, dispersion, and shared reef geometry |
 | `src/surface.rs` | parallel density sampling and 3D surface reconstruction |
 | `src/render.rs` | surface/volume uploads, reef, spray, diagnostic view |
 | `src/water.wgsl` | water absorption, reflections, light transmission, foam |
@@ -234,7 +274,7 @@ The solver knows nothing about TOML: `Config` is the file format, and
 `Config::fluid_params` converts it into the plain struct the solver takes. That
 keeps sections like `[render]` out of the physics. `Config::default()` retains
 the original dam-break defaults for compatibility; the shipped `config.toml`
-selects the wave preset. Both configurations have physical regression tests.
+selects the reef wave tank. Both configurations have physical regression tests.
 
 The main water surface is one mesh/material. Spray and the particle diagnostic
 share a small sphere mesh and material so they can be instanced. The water
@@ -262,9 +302,13 @@ can be wrong in ways that still compile and still produce plausible motion:
   only reachable by hand.
 - `reconstructed_water_is_closed_with_outward_normals` — watertight mesh edges,
   outward winding, unit normals, and a reasonable reconstructed volume.
-- `the_barrel_contains_air_below_a_resolved_lip` — empty cavity and overhead water.
-- `a_plunging_crest_stays_finite_and_above_the_reef` — stable collapse, preserved
-  particle count, reef collisions, compression, and deterministic replay.
+- `dispersion_sets_wavelength_from_period_and_depth` — the prescribed period
+  obeys the finite-depth dispersion relation and its deep-water limit.
+- `wavemaker_obeys_height_period_and_direction` — proportional amplitude, correct
+  period and direction, zero vertical motion at the bed, and an unforced reef.
+- `incoming_swell_reaches_the_reef_and_resets_cleanly` — waves travel from a flat
+  start to the shelf, exceed the motion in a zero-swell control, remain finite,
+  respect the reef, preserve particle count, and replay deterministically.
 - `slow_motion_preserves_the_physics` — identical particle states at the same
   simulated time at normal and quarter speed.
 - `coherent_translation_does_not_generate_foam` — speed alone does not whiten water.
@@ -272,7 +316,7 @@ can be wrong in ways that still compile and still produce plausible motion:
 For repeatable GPU screenshots (the app renders, saves, and exits):
 
 ```
-FLUIDS_CAPTURE_PATH=/tmp/barrel.png FLUIDS_CAPTURE_AT=0.25 cargo run --release
+FLUIDS_CAPTURE_PATH=/tmp/reef-swell.png FLUIDS_CAPTURE_AT=12 cargo run --release
 ```
 
 `FLUIDS_CAPTURE_AT` is simulation time in seconds, not wall-clock time. Captures

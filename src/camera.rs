@@ -46,22 +46,29 @@ fn spawn_camera(mut commands: Commands, config: Res<Config>) {
     let wave = config.scene.scenario == crate::config::Scenario::Wave;
     let orbit = OrbitCamera {
         target: Vec3::new(
-            0.0,
             if wave {
-                bounds.min.y + config.wave.water_depth + config.wave.height * 0.32
+                bounds.min.x + size.x * (config.wave.reef_start + config.wave.reef_width)
+            } else {
+                0.0
+            },
+            if wave {
+                bounds.min.y + config.wave.water_depth + config.swell.height * 0.32
             } else {
                 bounds.min.y + size.y * 0.30
             },
             0.0,
         ),
-        // Enough to hold the tank's diagonal in frame, so the wireframe reads
-        // as a box rather than as four lines leaving the top of the screen.
-        radius: size.length() * if wave { 0.88 } else { 1.05 },
+        // Focus on the reef break; the dam break keeps the whole tank in view.
+        radius: size.length() * if wave { 0.55 } else { 1.05 },
         yaw: if wave { 0.58 } else { 0.7 },
-        pitch: if wave { 0.17 } else { 0.30 },
+        pitch: 0.30,
     };
     commands.spawn((
         Camera3d::default(),
+        Projection::Perspective(PerspectiveProjection {
+            far: (size.length() * 12.0).max(10000.0),
+            ..default()
+        }),
         Hdr,
         Tonemapping::AcesFitted,
         place(&orbit),

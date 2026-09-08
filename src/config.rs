@@ -16,7 +16,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 use crate::sim::{Bounds, FluidParams};
-use crate::wave::Wave;
+use crate::wave::{Swell, Wave, Wavemaker};
 
 pub const DEFAULT_PATH: &str = "config.toml";
 
@@ -34,6 +34,7 @@ const COURANT_LIMIT: f32 = 0.95;
 pub struct Config {
     pub scene: Scene,
     pub wave: Wave,
+    pub swell: Swell,
     pub world: World,
     pub fluid: FluidBlock,
     pub solver: Solver,
@@ -282,7 +283,7 @@ impl Config {
     pub fn reset_fluid(&self, fluid: &mut crate::sim::Fluid) {
         fluid.params.gravity = Vec3::from(self.world.gravity);
         match self.scene.scenario {
-            Scenario::Wave => fluid.fill_wave(self.wave),
+            Scenario::Wave => fluid.fill_wave(self.wave, self.swell),
             Scenario::DamBreak => fluid.fill_block(self.fluid.block),
         }
     }
@@ -313,7 +314,11 @@ impl Config {
         let g = Vec3::from(self.world.gravity).length();
         let fall = (self.fluid.block[1] as f32 * self.fluid.spacing).min(self.world.height);
         if self.scene.scenario == Scenario::Wave {
-            (self.wave.speed.powi(2) + 2.0 * g * self.wave.height).sqrt()
+            let maker = Wavemaker::new(self.wave, self.swell, self.bounds(), g);
+            // Include the initial water column settling as well as orbital
+            // motion and the breaking crest, even when swell.height is zero.
+            maker.peak_speed()
+                + (2.0 * g * self.wave.water_depth + 4.0 * g * self.swell.height).sqrt()
         } else {
             (2.0 * g * fall).sqrt()
         }
@@ -415,6 +420,17 @@ impl Config {
         }
 
         let s = &self.solver;
+        if self.world.gravity.iter().any(|v| !v.is_finite()) {
+            return Err("world.gravity must be finite".into());
+        }
+        if self.scene.scenario == Scenario::Wave {
+            self.wave.validate(
+                self.swell,
+                self.bounds(),
+                f.spacing,
+                Vec3::from(self.world.gravity),
+            )?;
+        }
         if s.iterations == 0 {
             return Err("solver.iterations must be at least 1".into());
         }
@@ -491,12 +507,6 @@ impl Config {
                     "render.{name} must contain finite colors in [0, 1]"
                 ));
             }
-        }
-        if self.world.gravity.iter().any(|v| !v.is_finite()) {
-            return Err("world.gravity must be finite".into());
-        }
-        if self.scene.scenario == Scenario::Wave {
-            self.wave.validate(self.bounds(), f.spacing)?;
         }
         let voxels = ((self.bounds().size() + Vec3::splat(4.8 * f.spacing))
             / (f.spacing * self.render.surface_resolution))

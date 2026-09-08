@@ -6,27 +6,38 @@
 
 [scene]
 scenario = "wave"
-time_scale = 0.25
-replay_after = 1.4
+time_scale = 1.0
+# Let successive swells travel to the reef. R restarts; S slows playback.
+replay_after = 0.0
 
-# A pitching crest released into the particle solver. This previews a slab;
-# it does not yet generate a wave by propagating offshore swell onto a reef.
+[swell]
+# Direction of TRAVEL in degrees: 0 = +X toward the reef, positive = toward +Z.
+# The offshore wavemaker supports -60..60 degrees; the reef does not rotate.
+direction = 0.0
+# Offshore crest-to-trough height in world units (not height above sea level).
+height = 40.0
+# Simulation seconds between crests. Longer periods also need deeper/wider water.
+period = 1.8
+
 [wave]
-water_depth = 66.0
-height = 155.0
-lip_thickness = 0.23
-speed = 280.0
-curl = 2.55
-peel = 0.5
-reef_height = 28.0
+# Still-water depth offshore and rise of the submerged reef, in world units.
+water_depth = 190.0
+reef_height = 174.0
+# Fractions of world.width: a deep approach followed by a short, steep rise.
+reef_start = 0.30
+reef_width = 0.24
+# Change in reef X per unit Z, so the lip can break progressively along the reef.
+reef_skew = 0.12
+# Shoreward damping beach, as a fraction of world.width. Reduces reflected wash.
+beach_width = 0.22
 
 [world]
-# The tank, in world units.
-width = 560.0
+# World units are arbitrary: heights and depths share these units, time is seconds.
+# This preset's gravity sets its scale. For meters use gravity = [0, -9.81, 0]
+# and rescale all lengths, particle spacing, and input settings consistently.
+width = 1100.0
 height = 320.0
-depth = 400.0
-# Units per second squared. The tank is `height` units tall, so if you change
-# the tank, scale this with it to keep the fluid looking the same weight.
+depth = 360.0
 gravity = [0.0, -700.0, 0.0]
 
 [fluid]
@@ -53,13 +64,13 @@ block = [24, 26, 24]
 # RESOLUTION. Rest distance between neighbouring particles. Halving this packs
 # EIGHT times as many particles into the same water in 3D. It is the expensive
 # knob, and it does not stand alone -- see the two notes below.
-spacing = 10.0
+spacing = 8.0
 
 # How far a particle looks for neighbours. What matters is the RATIO to
 # `spacing`, which sets the neighbour count and with it the solver's whole
 # calibration, so change the two together. 2.0x is about 33 neighbours; the 2D
 # default of 2.4x would be 58 here, nearly twice the cost for no visible gain.
-smoothing_radius = 20.0
+smoothing_radius = 16.0
 
 [solver]
 # Solver steps per frame. The one to raise when you lower `spacing` or deepen
@@ -69,11 +80,9 @@ smoothing_radius = 20.0
 # combination and tells you what to set this to.
 substeps = 1
 
-# Jacobi iterations per substep. Drives compression down roughly linearly at a
-# matching cost. 3D needs fewer than 2D did for the same quality, because a
-# bigger neighbourhood carries more information per pass -- the 2D default of
-# 12 buys about 1.1% compression here against 2.0% at 8, and costs 35% more.
-iterations = 8
+# Jacobi iterations per substep. The deeper wave tank needs more passes than
+# the dam break to carry pressure through the water and preserve the swell.
+iterations = 16
 
 # Under-relaxation on the positional correction. Jacobi updates every particle
 # against stale neighbours, so applying the full correction overshoots and the
@@ -85,26 +94,24 @@ jacobi_relax = 0.5
 # Softens the constraint so free-surface particles don't get huge multipliers.
 relaxation = 0.05
 
-# XSPH viscosity. 0 is inviscid and jittery; ~0.1 reads as water; higher is
-# syrup.
-viscosity = 0.08
+# XSPH viscosity. Low here so the swell survives the offshore approach; higher
+# values damp the wave before it can reach the reef.
+viscosity = 0.02
 
-# Artificial pressure, which counteracts the clumping the density constraint
-# causes at the free surface. Raising `tensile_k` also reads as surface tension.
-tensile_k = 0.04
+# The wave preset resolves compression only. Keep artificial pressure OFF
+# with this mode so unsupported surface particles are not pushed apart.
+tensile_k = 0.0
 tensile_q = 0.2
 tensile_n = 4
 
-# Resolve compression only, ignoring under-dense particles. Tempting, since a
-# particle at the free surface reads under-dense purely from its kernel
-# sticking out into nothing. Measured, it does not improve the settled depth,
-# and past about 8 iterations it is unstable: with lambda zeroed the artificial
-# pressure above is unopposed, and it is purely repulsive.
-clamp_constraint = false
+# Resolve compression only, so the free surface can rise, stretch, and overturn.
+# Pair this with tensile_k = 0. Solid walls and the reef receive density support
+# in the wave scene. The dam-break defaults retain their original calibration.
+clamp_constraint = true
 
 # Fraction of tangential velocity kept when a particle touches a wall. 1.0 is
 # frictionless, 0.0 makes walls sticky.
-wall_friction = 0.98
+wall_friction = 1.0
 
 [render]
 # Continuous 3D water surface. Smaller cells resolve the lip more finely but

@@ -241,12 +241,14 @@ pub struct Fluid {
     /// Detached particle fraction, used to draw spray smaller than the mesh.
     pub spray: Vec<f32>,
     pub wave: Option<crate::wave::Wave>,
+    wavemaker: Option<crate::wave::Wavemaker>,
     pub elapsed: f32,
     /// Predicted positions, which the constraint solver actually moves.
     pred: Vec<Vec3>,
     lambda: Vec<f32>,
     delta: Vec<Vec3>,
     vel_scratch: Vec<Vec3>,
+    boundary: Vec<(f32, Vec3)>,
     kernels: Kernels,
     grid: Grid,
     /// Neighbour lists, flattened. Built once per substep and reused across all
@@ -273,11 +275,13 @@ impl Fluid {
             foam: Vec::new(),
             spray: Vec::new(),
             wave: None,
+            wavemaker: None,
             elapsed: 0.0,
             pred: Vec::new(),
             lambda: Vec::new(),
             delta: Vec::new(),
             vel_scratch: Vec::new(),
+            boundary: Vec::new(),
             grid: Grid::new(params.bounds, params.smoothing_radius),
             neighbors: Vec::new(),
             neighbor_start: Vec::new(),
@@ -301,6 +305,7 @@ impl Fluid {
     /// collapses into a dam break.
     pub fn fill_block(&mut self, counts: [usize; 3]) {
         self.wave = None;
+        self.wavemaker = None;
         self.pos.clear();
         self.vel.clear();
         let d = self.params.spacing;
@@ -327,12 +332,14 @@ impl Fluid {
         self.reset_scratch();
     }
 
-    pub fn fill_wave(&mut self, wave: crate::wave::Wave) {
+    pub fn fill_wave(&mut self, wave: crate::wave::Wave, swell: crate::wave::Swell) {
         self.wave = Some(wave);
         self.pos.clear();
         self.vel.clear();
         let d = self.params.spacing;
         let b = self.params.bounds;
+        let maker = crate::wave::Wavemaker::new(wave, swell, b, self.params.gravity.length());
+        self.wavemaker = Some(maker);
         let counts = (b.size() / d).floor().as_uvec3();
         for z in 0..counts.z {
             for y in 0..counts.y {
@@ -342,9 +349,9 @@ impl Fluid {
                     if p.y < wave.floor(p, b) + d * 0.5 {
                         continue;
                     }
-                    if let Some(v) = wave.sample(p, b) {
+                    if p.y <= wave.water_level(b) {
                         self.pos.push(p);
-                        self.vel.push(v);
+                        self.vel.push(Vec3::ZERO);
                     }
                 }
             }
@@ -362,6 +369,7 @@ impl Fluid {
         self.lambda = vec![0.0; n];
         self.delta = vec![Vec3::ZERO; n];
         self.vel_scratch = vec![Vec3::ZERO; n];
+        self.boundary = vec![(0.0, Vec3::ZERO); n];
         // These describe the configuration we just threw away. Leaving them
         // would let `compression_error` report densities for the old state,
         // and would index out of bounds if the particle count changed.
@@ -424,10 +432,10 @@ impl Fluid {
         self.previous_pos.clone_from(&self.pos);
         let sub_dt = dt / substeps as f32;
         for _ in 0..substeps {
+            self.elapsed += sub_dt;
             self.substep(sub_dt);
         }
         self.update_foam(dt);
-        self.elapsed += dt;
     }
 
     fn substep(&mut self, dt: f32) {
@@ -435,6 +443,8 @@ impl Fluid {
         let (min, max) = self.wall_limits();
         let gravity = self.params.gravity;
         let wave = self.wave;
+        let maker = self.wavemaker;
+        let time = self.elapsed;
         let bounds = self.params.bounds;
         let margin = self.params.spacing * 0.5;
         self.pred
@@ -442,10 +452,13 @@ impl Fluid {
             .zip(self.vel.par_iter_mut())
             .zip(self.pos.par_iter())
             .for_each(|((pred, vel), pos)| {
+                if let Some(maker) = maker {
+                    *vel = maker.drive(*pos, *vel, time, dt) * maker.damping(*pos, dt);
+                }
                 *vel += gravity * dt;
                 *pred = (*pos + *vel * dt).clamp(min, max);
                 if let Some(wave) = wave {
-                    pred.y = pred.y.max(wave.floor(*pred, bounds) + margin);
+                    wave.project(pred, bounds, margin);
                 }
             });
 
@@ -584,13 +597,46 @@ impl Fluid {
         let neighbors = &self.neighbors;
         let starts = &self.neighbor_start;
 
+        if let Some(wave) = self.wave {
+            let bounds = self.params.bounds;
+            let h = self.kernels.h;
+            self.boundary
+                .par_iter_mut()
+                .zip(pred.par_iter())
+                .for_each(|(out, p)| {
+                    let normal = wave.normal(*p, bounds);
+                    *out = (0.0, Vec3::ZERO);
+                    for (distance, normal) in [
+                        ((p.y - wave.floor(*p, bounds)) * normal.y, normal),
+                        (p.x - bounds.min.x, Vec3::X),
+                        (bounds.max.x - p.x, Vec3::NEG_X),
+                        (p.z - bounds.min.z, Vec3::Z),
+                        (bounds.max.z - p.z, Vec3::NEG_Z),
+                        (bounds.max.y - p.y, Vec3::NEG_Y),
+                    ] {
+                        let q = (distance / h).clamp(0.0, 1.0);
+                        if q < 1.0 {
+                            // Integral of the normalized 3D poly6 kernel inside a
+                            // solid half-space, and its gradient. Solid volume fills
+                            // the missing kernel support instead of shrinking the sea.
+                            let integral = q - 4.0 * q.powi(3) / 3.0 + 6.0 * q.powi(5) / 5.0
+                                - 4.0 * q.powi(7) / 7.0
+                                + q.powi(9) / 9.0;
+                            out.0 += (0.5 - 315.0 / 256.0 * integral).max(0.0);
+                            out.1 -= normal * (315.0 / 256.0 / h * (1.0 - q * q).powi(4));
+                        }
+                    }
+                });
+        }
+        let boundary = &self.boundary;
+
         // Density, constraint value, and the multiplier that will correct it.
         self.lambda.par_iter_mut().enumerate().for_each(|(i, out)| {
             let pi = pred[i];
             let mut rho = kernels.poly6(0.0);
             // Gradient of C_i with respect to p_i, and the sum of squared
             // gradients with respect to every particle in the neighbourhood.
-            let mut grad_self = Vec3::ZERO;
+            let mut grad_self = boundary[i].1;
             let mut sum_sq = 0.0;
             for &j in &neighbors[starts[i] as usize..starts[i + 1] as usize] {
                 let r = pi - pred[j as usize];
@@ -600,7 +646,7 @@ impl Fluid {
                 sum_sq += g.length_squared();
             }
             sum_sq += grad_self.length_squared();
-            let c = rho * inv_rho0 - 1.0;
+            let c = rho * inv_rho0 + boundary[i].0 - 1.0;
             if clamp && c <= 0.0 {
                 *out = 0.0;
             } else {
@@ -620,7 +666,7 @@ impl Fluid {
                 let s_corr = -tensile_scale * ratio.powi(tensile_n);
                 d += kernels.spiky_grad(r) * (li + lambda[j as usize] + s_corr);
             }
-            *out = d * (inv_rho0 * relax);
+            *out = (d * inv_rho0 + boundary[i].1 * li) * relax;
         });
 
         let delta = &self.delta;
@@ -633,7 +679,7 @@ impl Fluid {
             .for_each(|(p, d)| {
                 *p = (*p + *d).clamp(min, max);
                 if let Some(wave) = wave {
-                    p.y = p.y.max(wave.floor(*p, bounds) + margin);
+                    wave.project(p, bounds, margin);
                 }
             });
     }
@@ -718,7 +764,7 @@ impl Fluid {
                         .kernels
                         .poly6((pi - self.pos[j as usize]).length_squared());
                 }
-                (rho / self.rest_density - 1.0).max(0.0)
+                (rho / self.rest_density + self.boundary[i].0 - 1.0).max(0.0)
             })
             .sum();
         total / self.pos.len() as f32
@@ -758,6 +804,11 @@ impl Fluid {
                     && p.z > min.z + h
                     && p.z < max.z - h
                     && p.y > min.y + h
+                    && self.wave.is_none_or(|wave| {
+                        (p.y - wave.floor(**p, self.params.bounds))
+                            * wave.normal(**p, self.params.bounds).y
+                            > h
+                    })
                     && p.y < top - h
             })
             .map(|(i, _)| {

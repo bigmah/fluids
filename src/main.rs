@@ -111,6 +111,18 @@ fn main() {
         config.solver.substeps,
         config.solver.iterations
     );
+    if config.scene.scenario == config::Scenario::Wave {
+        println!(
+            "Swell: travel {:.1} degrees toward +X/+Z, height {:.1} units, period {:.2}s, wavelength {:.1} units; shelf depth {:.1} units",
+            config.swell.direction,
+            config.swell.height,
+            config.swell.period,
+            config
+                .swell
+                .wavelength(-config.world.gravity[1], config.wave.water_depth),
+            config.wave.water_depth - config.wave.reef_height,
+        );
+    }
 
     let capture = std::env::var("FLUIDS_CAPTURE_PATH")
         .ok()
@@ -308,7 +320,7 @@ fn update_title(
     window.title = format!(
         "{} | {:.2}s / {:.2}x | {} particles | {:.1} ms ({:.1} solve + {:.1} surface) | compression {:.1}% | bulk {bulk} | peak {:.0}{} | SPACE pause · R replay · S speed · P particles · B bounds",
         if fluid.wave.is_some() {
-            "Slab / breaking wave"
+            "Swell / reef break"
         } else {
             "Fluids / dam break"
         },
