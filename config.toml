@@ -4,17 +4,33 @@
 #
 # Pass a different file as the first argument: `cargo run --release -- big.toml`
 
+[scene]
+scenario = "wave"
+time_scale = 0.25
+replay_after = 1.4
+
+# A pitching crest released into the particle solver. This previews a slab;
+# it does not yet generate a wave by propagating offshore swell onto a reef.
+[wave]
+water_depth = 66.0
+height = 155.0
+lip_thickness = 0.23
+speed = 280.0
+curl = 2.55
+peel = 0.5
+reef_height = 28.0
+
 [world]
 # The tank, in world units.
-width = 400.0
-height = 300.0
+width = 560.0
+height = 320.0
 depth = 400.0
 # Units per second squared. The tank is `height` units tall, so if you change
 # the tank, scale this with it to keep the fluid looking the same weight.
-gravity = [0.0, -1400.0, 0.0]
+gravity = [0.0, -700.0, 0.0]
 
 [fluid]
-# HOW MUCH WATER: particles along x, y and z in the starting block. It starts
+# DAM BREAK ONLY: particles along x, y and z in the starting block. It starts
 # in a corner and collapses, so more of it means a deeper pool.
 #
 # This is cubed, not squared: adding 20% to each side is 1.7x the particles.
@@ -26,8 +42,8 @@ gravity = [0.0, -1400.0, 0.0]
 #   [39, 29, 39] = 44109 particles   15.6 ms/step   5.5% compression  (full tank)
 #
 # The solver holds 60fps across all of those, but it is only half the frame:
-# the renderer draws a sphere per particle, so the top of that range is limited
-# by drawing rather than by physics. Compression climbing with size is the
+# surface reconstruction and shading also add a frame cost. These historical
+# timings cover only the solver. Compression climbing with size is the
 # deeper pool -- more hydrostatic load for the same iteration count, so raise
 # solver.iterations alongside if you want it back down.
 #
@@ -91,20 +107,22 @@ clamp_constraint = false
 wall_friction = 0.98
 
 [render]
-# Sphere diameter as a multiple of `spacing`. Below about 2.0 neighbouring
-# particles stop touching and the fluid reads as a bag of beads rather than a
-# body of water. Above about 3.0 it turns into a blob.
+# Continuous 3D water surface. Smaller cells resolve the lip more finely but
+# cost more CPU time. P toggles the particle diagnostic; B toggles tank bounds.
+surface_resolution = 0.85
+show_bounds = false
+# Spray droplet size multiplier; 2.4 is the reference size. This does not
+# change the reconstructed water surface.
 particle_scale = 2.4
 
-# Speed at which a particle is drawn as full white foam. Lower it for more
-# foam. For reference, a settled pool sits near 30 units/s and a breaking wave
-# peaks around 750.
+# Foam visibility calibration (legacy field name). Lower makes more of the
+# solver's aeration indicator visible. Fast coherent water stays clear.
 foam_speed = 700.0
 
-# Linear RGB, 0..1. The gradient runs deep -> mid -> foam with speed.
-background = [0.05, 0.06, 0.10]
-deep_color = [0.06, 0.25, 0.75]
-mid_color = [0.25, 0.72, 0.98]
+# sRGB, 0..1. Deep absorption/scattering, sunlit water, and aerated foam.
+background = [0.67, 0.80, 0.87]
+deep_color = [0.015, 0.16, 0.20]
+mid_color = [0.08, 0.58, 0.53]
 foam_color = [0.92, 0.98, 1.00]
 
 # Cap the frame rate to the display. Turn it off to see what a frame actually

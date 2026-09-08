@@ -16,6 +16,7 @@ use serde::Deserialize;
 use std::path::Path;
 
 use crate::sim::{Bounds, FluidParams};
+use crate::wave::Wave;
 
 pub const DEFAULT_PATH: &str = "config.toml";
 
@@ -31,11 +32,40 @@ const COURANT_LIMIT: f32 = 0.95;
 #[derive(Debug, Clone, Default, Deserialize, Resource)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub scene: Scene,
+    pub wave: Wave,
     pub world: World,
     pub fluid: FluidBlock,
     pub solver: Solver,
     pub render: Render,
     pub input: Input,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Scenario {
+    #[default]
+    DamBreak,
+    Wave,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Scene {
+    pub scenario: Scenario,
+    pub time_scale: f32,
+    /// Simulation seconds between replays; zero disables replay.
+    pub replay_after: f32,
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            scenario: Scenario::DamBreak,
+            time_scale: 1.0,
+            replay_after: 0.0,
+        }
+    }
 }
 
 /// The box the fluid lives in. The window is sized to match.
@@ -60,7 +90,7 @@ pub struct FluidBlock {
     /// adding 20% to each side is nearly double the particles.
     pub block: [usize; 3],
     /// Rest distance between neighbouring particles. This is the knob for
-    /// *resolution*: halving it packs four times as many particles into the
+    /// *resolution*: halving it packs eight times as many particles into the
     /// same volume of water. Change `smoothing_radius` with it.
     pub spacing: f32,
     /// Kernel radius: how far a particle looks for neighbours. What matters is
@@ -106,13 +136,14 @@ pub struct Solver {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Render {
-    /// Particle sprite diameter, as a multiple of `spacing`. Below about 2.0
-    /// neighbouring particles stop overlapping and the fluid reads as a dot
-    /// screen rather than a body of water.
+    /// Reconstruction voxel width, as a multiple of particle spacing.
+    pub surface_resolution: f32,
+    pub show_bounds: bool,
+    /// Spray droplet size multiplier; 2.4 is the reference size.
     pub particle_scale: f32,
-    /// Speed at which a particle is drawn as full white foam.
+    /// Legacy foam visibility calibration; smaller values reveal more aeration.
     pub foam_speed: f32,
-    /// Linear RGB, 0..1.
+    /// sRGB, 0..1.
     pub background: [f32; 3],
     pub deep_color: [f32; 3],
     pub mid_color: [f32; 3],
@@ -179,11 +210,13 @@ impl Default for Solver {
 impl Default for Render {
     fn default() -> Self {
         Self {
+            surface_resolution: 0.85,
+            show_bounds: false,
             particle_scale: 2.4,
             foam_speed: 900.0,
-            background: [0.05, 0.06, 0.10],
-            deep_color: [0.06, 0.25, 0.75],
-            mid_color: [0.25, 0.72, 0.98],
+            background: [0.67, 0.80, 0.87],
+            deep_color: [0.015, 0.16, 0.20],
+            mid_color: [0.08, 0.58, 0.53],
             foam_color: [0.92, 0.98, 1.00],
             vsync: true,
         }
@@ -245,6 +278,15 @@ impl Config {
         self.fluid.block.iter().product()
     }
 
+    /// Scene selection stays outside the solver, alongside config conversion.
+    pub fn reset_fluid(&self, fluid: &mut crate::sim::Fluid) {
+        fluid.params.gravity = Vec3::from(self.world.gravity);
+        match self.scene.scenario {
+            Scenario::Wave => fluid.fill_wave(self.wave),
+            Scenario::DamBreak => fluid.fill_block(self.fluid.block),
+        }
+    }
+
     pub fn fluid_params(&self) -> FluidParams {
         FluidParams {
             smoothing_radius: self.fluid.smoothing_radius,
@@ -270,7 +312,11 @@ impl Config {
     pub fn expected_peak_speed(&self) -> f32 {
         let g = Vec3::from(self.world.gravity).length();
         let fall = (self.fluid.block[1] as f32 * self.fluid.spacing).min(self.world.height);
-        (2.0 * g * fall).sqrt()
+        if self.scene.scenario == Scenario::Wave {
+            (self.wave.speed.powi(2) + 2.0 * g * self.wave.height).sqrt()
+        } else {
+            (2.0 * g * fall).sqrt()
+        }
     }
 
     /// How far the fastest particle travels in one solver substep, in units of
@@ -343,7 +389,8 @@ impl Config {
         // A block that does not fit would be clamped into the walls at spawn,
         // starting the sim from a badly compressed state.
         let max = self.max_block();
-        if (0..3).any(|axis| f.block[axis] > max[axis]) {
+        if self.scene.scenario == Scenario::DamBreak && (0..3).any(|axis| f.block[axis] > max[axis])
+        {
             return Err(format!(
                 "the starting block does not fit in the world: {}x{}x{} particles at \
                  spacing {} needs a {:.0}x{:.0}x{:.0} box, but world is {:.0}x{:.0}x{:.0}. \
@@ -413,11 +460,50 @@ impl Config {
                 s.wall_friction
             ));
         }
-        if self.render.particle_scale <= 0.0 {
+        if !self.render.particle_scale.is_finite() || self.render.particle_scale <= 0.0 {
             return Err("render.particle_scale must be positive".into());
         }
-        if self.render.foam_speed <= 0.0 {
+        if !self.render.foam_speed.is_finite() || self.render.foam_speed <= 0.0 {
             return Err("render.foam_speed must be positive".into());
+        }
+        if !self.scene.time_scale.is_finite() || !(0.05..=1.0).contains(&self.scene.time_scale) {
+            return Err("scene.time_scale must be in [0.05, 1]".into());
+        }
+        if !self.scene.replay_after.is_finite() || self.scene.replay_after < 0.0 {
+            return Err("scene.replay_after must be finite and nonnegative".into());
+        }
+        if !self.render.surface_resolution.is_finite()
+            || !(0.5..=2.0).contains(&self.render.surface_resolution)
+        {
+            return Err("render.surface_resolution must be in [0.5, 2]".into());
+        }
+        for (name, values) in [
+            ("background", self.render.background),
+            ("deep_color", self.render.deep_color),
+            ("mid_color", self.render.mid_color),
+            ("foam_color", self.render.foam_color),
+        ] {
+            if values
+                .iter()
+                .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+            {
+                return Err(format!(
+                    "render.{name} must contain finite colors in [0, 1]"
+                ));
+            }
+        }
+        if self.world.gravity.iter().any(|v| !v.is_finite()) {
+            return Err("world.gravity must be finite".into());
+        }
+        if self.scene.scenario == Scenario::Wave {
+            self.wave.validate(self.bounds(), f.spacing)?;
+        }
+        let voxels = ((self.bounds().size() + Vec3::splat(4.8 * f.spacing))
+            / (f.spacing * self.render.surface_resolution))
+            .ceil()
+            + Vec3::ONE;
+        if voxels.x * voxels.y * voxels.z > 4_000_000.0 {
+            return Err("surface grid exceeds four million samples; raise render.surface_resolution or fluid.spacing".into());
         }
         Ok(())
     }

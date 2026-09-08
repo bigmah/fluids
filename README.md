@@ -1,16 +1,66 @@
 # fluids
 
-A 3D water simulation in Rust, using [Bevy](https://bevyengine.org) for the
-window and rendering.
+A 3D particle water simulation in Rust and [Bevy](https://bevyengine.org), with a
+continuous water surface and a plunging, thick-lipped barrel study.
 
-![the dam break throwing a central jet](docs/dam-break.png)
+![The simulated barrel, 0.12 seconds after release](docs/barrel.png)
+
+The default scene releases a pitching crest over a reef shelf. The lip has real
+thickness and the barrel contains air; the particle solver drives the collapse,
+impact, and wash. Playback starts at quarter speed and replays automatically.
 
 ```
 cargo run --release
 ```
 
-Release mode matters: the solver does roughly 7 ms of work per frame at the
-default particle count, and a debug build is around 50x slower than that.
+For the original dam break with the new surface renderer:
+
+```
+cargo run --release -- dam-break.toml
+```
+
+This is an initialized barrel study, **not yet a simulation of offshore swell
+shoaling and breaking at Pipeline**. The crest starts in a shaped configuration
+with an initial velocity field. Nothing animates or holds its shape after release.
+The reef is a smooth, approximate shelf, not measured Pipeline bathymetry.
+
+## Water appearance and wave shape
+
+The renderer reconstructs a full 3D density isosurface with marching tetrahedra,
+so an overhanging lip and its underside can exist in the same horizontal location.
+Smooth density-gradient normals replace the old individually lit spheres.
+A matching 3D density texture lets the water shader estimate refracted path
+length, color absorption, and how much the lip blocks sunlight inside the barrel.
+Fresnel reflections use a procedural sky. Foam follows local velocity disorder,
+persists on the particles, and dissipates; detached fast particles become spray.
+
+The optics are approximate: the shader uses a procedural sky and seabed instead
+of tracing the rendered scene. Foam is a visual aeration indicator, not a bubble
+or air-pressure simulation. Isotropic reconstruction still rounds sheets thinner
+than a few particles. These are the main remaining limits on realism.
+
+Useful settings in `config.toml`:
+
+| Setting | Effect |
+|---|---|
+| `wave.height` | Crest height above the pool |
+| `wave.lip_thickness` | Lip thickness as a fraction of height; keep at least two particle layers |
+| `wave.curl` | How far the lip has pitched at release, in radians |
+| `wave.peel` | Curl variation along the crest |
+| `wave.speed` | Initial crest velocity |
+| `wave.reef_height` | Rise of the collision shelf |
+| `scene.time_scale` | Playback speed, without changing the physics timestep |
+| `scene.replay_after` | Replay interval in simulated seconds; `0` disables it |
+| `render.surface_resolution` | Mesh voxel size / particle spacing; smaller costs more CPU |
+| `render.foam_speed` | Foam visibility calibration; lower makes more foam visible |
+
+Slow motion scales the simulation clock. The renderer interpolates particle
+positions between fixed solver steps, so slowing playback does not increase
+viscosity or artificial pressure.
+
+Release mode matters. The solver and surface reconstruction both run on the CPU;
+the title reports their costs separately. The historical solver benchmarks below
+refer to the dam break, before surface reconstruction was added.
 
 Everything tunable lives in [`config.toml`](config.toml), which is commented in
 full. Every field is optional, so a file naming one value is a legal config, and
@@ -26,8 +76,12 @@ argument: `cargo run --release -- big.toml`.
 | right drag | orbit the camera |
 | scroll | zoom |
 | space | pause / resume |
-| `R` | reset to the starting dam break |
+| `R` | replay the current scene, clearing foam and restoring gravity |
 | `G` | flip gravity |
+| `S` | toggle normal speed / slow motion |
+| `P` | toggle water surface / particle diagnostic |
+| `B` | toggle tank bounds |
+| `F12` | save a screenshot in the working directory |
 
 The fluid is on the left button, as it was in the 2D version; the camera took
 the right one. A screen position names a ray rather than a point, so the push
@@ -41,12 +95,12 @@ free surface is really free to move — and in 3D there is more water in every
 direction to resist it. `input.mouse_strength` is the knob, and `config.toml`
 carries the measured response curve.
 
-The window title carries a live readout: particle count, how far the fluid is
-from incompressible, the bulk density, and the speed of the fastest particle.
+The window title shows simulation time and speed, particle count, frame/solver/
+surface timings, compression, bulk density, and peak particle speed.
 
 ## How it works
 
-The solver is **Position Based Fluids** (Macklin & Müller, SIGGRAPH 2013) rather
+The solver is [**Position Based Fluids**](https://matthias-research.github.io/pages/publications/pbf_sig_preprint.pdf) (Macklin & Müller, SIGGRAPH 2013) rather
 than a force-based SPH scheme. Both model the same thing, but they enforce
 incompressibility differently, and that difference decides the timestep:
 
@@ -105,7 +159,7 @@ substep and reused across all solver iterations.
 
 There are two knobs, and they do different things.
 
-**More water, same detail.** Raise `fluid.block`. It starts in a corner and
+**More water, same detail (dam break).** Raise `fluid.block`. It starts in a corner and
 collapses, so a bigger block means a deeper pool. Note it is cubed, not squared.
 Solver cost, measured on an M4 Pro (10 performance cores):
 
@@ -116,9 +170,9 @@ Solver cost, measured on an M4 Pro (10 performance cores):
 | `[30, 29, 30]` | 26100 | 10.1 | 3.2% |
 | `[39, 29, 39]` | 44109 | 15.6 | 5.5% |
 
-The solver holds 60 fps across all of those, but it is only half the frame: the
-renderer draws a sphere per particle, so the top of that range is limited by
-drawing rather than by physics. Compression climbing with size is just the
+Those measurements cover the solver only. The new renderer also samples a 3D
+density grid, extracts a surface, and uploads the mesh and volume each frame.
+Compression climbing with size is just the
 deeper pool — more hydrostatic load for the same iteration count.
 
 **Finer detail, same water.** Lower `fluid.spacing`, and lower
@@ -149,12 +203,10 @@ deeper *in particles* and needs more passes, not fewer.
 
 ![the pool settled](docs/settled.png)
 
-**It draws particles, not a surface.** The fluid is a pile of lit spheres, which
-is what it honestly is. Making it read as continuous liquid is a rendering
-problem rather than a simulation one, and the usual answer — screen-space fluid
-rendering: splat depth, blur it, rebuild normals from the smoothed depth, then
-shade with refraction — is a larger piece of work than the solver it would sit
-on.
+**No offshore wavemaker or air phase yet.** The barrel preset is an initial
+condition. Predicting a breaking wave from incoming swell will need a wavemaker,
+absorbing boundaries, calibrated reef geometry, and finer fluid resolution.
+Entrained air and bubble dynamics are outside this single-phase solver.
 
 **Walls have no boundary particles.** A hard wall truncates the smoothing kernel
 the same way a free surface does, so the layer of particles resting on the floor
@@ -171,21 +223,22 @@ or a wall density correction, not a change to the solver.
 |---|---|
 | `src/sim.rs` | the solver — no rendering, no ECS in the hot path |
 | `src/config.rs` | the `config.toml` format, its defaults, and validation |
-| `src/render.rs` | one sphere per particle, coloured by speed |
+| `src/wave.rs` | pitching-crest initial conditions and shared reef geometry |
+| `src/surface.rs` | parallel density sampling and 3D surface reconstruction |
+| `src/render.rs` | surface/volume uploads, reef, spray, diagnostic view |
+| `src/water.wgsl` | water absorption, reflections, light transmission, foam |
 | `src/camera.rs` | orbit camera |
 | `src/main.rs` | app wiring, input, window title readout |
 
 The solver knows nothing about TOML: `Config` is the file format, and
 `Config::fluid_params` converts it into the plain struct the solver takes. That
-keeps sections like `[render]` out of the physics, and keeps `config.toml` the
-single source of the defaults — the tests read them from there too, so they
-exercise what actually ships.
+keeps sections like `[render]` out of the physics. `Config::default()` retains
+the original dam-break defaults for compatibility; the shipped `config.toml`
+selects the wave preset. Both configurations have physical regression tests.
 
-Colouring by speed needs per-particle colour, and a `StandardMaterial` carries
-one colour for every mesh sharing it. Rather than a material per particle, which
-would be a draw call per particle, the speed range is quantised into 24
-materials and each particle points at the nearest — so the fluid batches into 24
-instanced draws however many particles there are.
+The main water surface is one mesh/material. Spray and the particle diagnostic
+share a small sphere mesh and material so they can be instanced. The water
+shader is embedded in the executable; no external art assets are needed.
 
 ## Tests
 
@@ -207,6 +260,23 @@ can be wrong in ways that still compile and still produce plausible motion:
 - `the_bulk_holds_its_rest_density` — measured geometrically, see above.
 - `radial_impulse_pushes_out_and_pulls_in` — the mouse force, which is otherwise
   only reachable by hand.
+- `reconstructed_water_is_closed_with_outward_normals` — watertight mesh edges,
+  outward winding, unit normals, and a reasonable reconstructed volume.
+- `the_barrel_contains_air_below_a_resolved_lip` — empty cavity and overhead water.
+- `a_plunging_crest_stays_finite_and_above_the_reef` — stable collapse, preserved
+  particle count, reef collisions, compression, and deterministic replay.
+- `slow_motion_preserves_the_physics` — identical particle states at the same
+  simulated time at normal and quarter speed.
+- `coherent_translation_does_not_generate_foam` — speed alone does not whiten water.
+
+For repeatable GPU screenshots (the app renders, saves, and exits):
+
+```
+FLUIDS_CAPTURE_PATH=/tmp/barrel.png FLUIDS_CAPTURE_AT=0.25 cargo run --release
+```
+
+`FLUIDS_CAPTURE_AT` is simulation time in seconds, not wall-clock time. Captures
+disable automatic replay and allow the renderer to warm up at the requested time.
 
 The config has its own set, which mostly exist to keep it from failing quietly:
 a typo'd field is rejected rather than ignored, a named config file that does

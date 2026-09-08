@@ -5,6 +5,7 @@
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
+use bevy::{camera::Hdr, core_pipeline::tonemapping::Tonemapping};
 use core::f32::consts::FRAC_PI_2;
 
 use crate::config::Config;
@@ -42,15 +43,30 @@ fn spawn_camera(mut commands: Commands, config: Res<Config>) {
     // Aimed a little below the middle of the tank rather than at its centre:
     // the water spends most of its time in the bottom half, and pointing at
     // the geometric centre wastes the upper third of the frame on empty space.
+    let wave = config.scene.scenario == crate::config::Scenario::Wave;
     let orbit = OrbitCamera {
-        target: Vec3::new(0.0, bounds.min.y + size.y * 0.30, 0.0),
+        target: Vec3::new(
+            0.0,
+            if wave {
+                bounds.min.y + config.wave.water_depth + config.wave.height * 0.32
+            } else {
+                bounds.min.y + size.y * 0.30
+            },
+            0.0,
+        ),
         // Enough to hold the tank's diagonal in frame, so the wireframe reads
         // as a box rather than as four lines leaving the top of the screen.
-        radius: size.length() * 1.15,
-        yaw: 0.7,
-        pitch: 0.30,
+        radius: size.length() * if wave { 0.88 } else { 1.05 },
+        yaw: if wave { 0.58 } else { 0.7 },
+        pitch: if wave { 0.17 } else { 0.30 },
     };
-    commands.spawn((Camera3d::default(), place(&orbit), orbit));
+    commands.spawn((
+        Camera3d::default(),
+        Hdr,
+        Tonemapping::AcesFitted,
+        place(&orbit),
+        orbit,
+    ));
 }
 
 fn place(orbit: &OrbitCamera) -> Transform {

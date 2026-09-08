@@ -1,0 +1,5 @@
+# The original physics scene, using the new water surface renderer.
+[scene]
+scenario = "dam_break"
+[render]
+show_bounds = true
