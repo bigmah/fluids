@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["bevy_winit", "bevy_sprite", "bevy_core_pipeline", "bevy_asset", "bevy_log", "bevy_window", "multi_threaded", "std", "bevy_sprite_render", "png"] }
+bevy = { version = "0.19", default-features = false, features = ["bevy_winit", "bevy_sprite", "bevy_core_pipeline", "bevy_asset", "bevy_log", "bevy_window", "multi_threaded", "std", "bevy_sprite_render", "png", "bevy_pbr", "tonemapping_luts", "ktx2", "zstd_rust"] }
+rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 

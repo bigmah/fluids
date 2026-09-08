@@ -1,0 +1,87 @@
+//! A minimal orbit camera: drag to turn, scroll to zoom.
+//!
+//! The fluid needs the right mouse button, so orbiting is on the left.
+
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
+use bevy::prelude::*;
+use core::f32::consts::FRAC_PI_2;
+
+use crate::config::Config;
+
+/// Spherical coordinates around the origin.
+#[derive(Component)]
+pub struct OrbitCamera {
+    /// The point the camera looks at and swings around.
+    pub target: Vec3,
+    pub radius: f32,
+    /// Angle around the vertical axis.
+    pub yaw: f32,
+    /// Angle above the horizontal. Clamped short of the poles, where the
+    /// up-vector becomes ambiguous and the view snaps.
+    pub pitch: f32,
+}
+
+const MIN_PITCH: f32 = -0.2;
+const MAX_PITCH: f32 = FRAC_PI_2 - 0.05;
+const ORBIT_SENSITIVITY: f32 = 0.006;
+const ZOOM_SENSITIVITY: f32 = 0.12;
+
+pub struct OrbitCameraPlugin;
+
+impl Plugin for OrbitCameraPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Startup, spawn_camera)
+            .add_systems(Update, orbit);
+    }
+}
+
+fn spawn_camera(mut commands: Commands, config: Res<Config>) {
+    let bounds = config.bounds();
+    let size = bounds.size();
+    // Aimed a little below the middle of the tank rather than at its centre:
+    // the water spends most of its time in the bottom half, and pointing at
+    // the geometric centre wastes the upper third of the frame on empty space.
+    let orbit = OrbitCamera {
+        target: Vec3::new(0.0, bounds.min.y + size.y * 0.30, 0.0),
+        // Enough to hold the tank's diagonal in frame, so the wireframe reads
+        // as a box rather than as four lines leaving the top of the screen.
+        radius: size.length() * 1.15,
+        yaw: 0.7,
+        pitch: 0.30,
+    };
+    commands.spawn((Camera3d::default(), place(&orbit), orbit));
+}
+
+fn place(orbit: &OrbitCamera) -> Transform {
+    let (sy, cy) = orbit.yaw.sin_cos();
+    let (sp, cp) = orbit.pitch.sin_cos();
+    let eye = orbit.target + Vec3::new(cp * sy, sp, cp * cy) * orbit.radius;
+    Transform::from_translation(eye).looking_at(orbit.target, Vec3::Y)
+}
+
+fn orbit(
+    buttons: Res<ButtonInput<MouseButton>>,
+    motion: Res<AccumulatedMouseMotion>,
+    scroll: Res<AccumulatedMouseScroll>,
+    mut camera: Single<(&mut OrbitCamera, &mut Transform)>,
+) {
+    let (orbit, transform) = &mut *camera;
+    let mut moved = false;
+
+    if buttons.pressed(MouseButton::Left) && motion.delta != Vec2::ZERO {
+        orbit.yaw -= motion.delta.x * ORBIT_SENSITIVITY;
+        orbit.pitch =
+            (orbit.pitch + motion.delta.y * ORBIT_SENSITIVITY).clamp(MIN_PITCH, MAX_PITCH);
+        moved = true;
+    }
+    if scroll.delta.y != 0.0 {
+        // Scale the step by the current distance, so zooming feels the same
+        // whether you are close in or far out.
+        orbit.radius =
+            (orbit.radius * (1.0 - scroll.delta.y * ZOOM_SENSITIVITY)).clamp(50.0, 8000.0);
+        moved = true;
+    }
+    if moved {
+        **transform = place(orbit);
+    }
+}

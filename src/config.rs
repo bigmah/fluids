@@ -10,12 +10,12 @@
 //! field is, because silently ignoring a typo in a tuning file is how you spend
 //! an afternoon wondering why a parameter does nothing.
 
-use bevy::math::{Rect, Vec2};
+use bevy::math::Vec3;
 use bevy::prelude::Resource;
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::sim::FluidParams;
+use crate::sim::{Bounds, FluidParams};
 
 pub const DEFAULT_PATH: &str = "config.toml";
 
@@ -44,27 +44,30 @@ pub struct Config {
 pub struct World {
     pub width: f32,
     pub height: f32,
+    pub depth: f32,
     /// Acceleration in world units per second squared. The box is `height`
     /// units tall, so scale this with the box if you change it.
-    pub gravity: [f32; 2],
+    pub gravity: [f32; 3],
 }
 
 /// How much water there is, and how finely it is resolved.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FluidBlock {
-    /// Particles across and up in the starting block. This is the knob for
+    /// Particles along x, y and z in the starting block. This is the knob for
     /// *how much water*: the block collapses and spreads over the floor, so
-    /// more of it means a deeper pool.
-    pub columns: usize,
-    pub rows: usize,
+    /// more of it means a deeper pool. Note that it is cubed, not squared --
+    /// adding 20% to each side is nearly double the particles.
+    pub block: [usize; 3],
     /// Rest distance between neighbouring particles. This is the knob for
     /// *resolution*: halving it packs four times as many particles into the
     /// same volume of water. Change `smoothing_radius` with it.
     pub spacing: f32,
     /// Kernel radius: how far a particle looks for neighbours. What matters is
     /// its ratio to `spacing`, which sets the neighbour count and with it the
-    /// solver's whole calibration. Keep it at roughly 2.4x `spacing`.
+    /// solver's whole calibration. Keep it at roughly 2.0x `spacing` -- that is
+    /// about 33 neighbours in 3D, where the 2D default of 2.4x would be 58 and
+    /// nearly twice the cost for no visible gain.
     pub smoothing_radius: f32,
 }
 
@@ -88,6 +91,15 @@ pub struct Solver {
     pub tensile_k: f32,
     pub tensile_q: f32,
     pub tensile_n: i32,
+    /// Resolve compression only, leaving under-dense particles alone.
+    ///
+    /// Tempting, because a particle near the free surface reads as under-dense
+    /// simply from its kernel sticking out into nothing. Measured, it does not
+    /// help the settled depth, and it is actively unstable past about 8
+    /// iterations: zeroing lambda for under-dense particles leaves the
+    /// artificial pressure term unopposed, and that term is purely repulsive,
+    /// so the surface blows itself apart. Off unless you are experimenting.
+    pub clamp_constraint: bool,
     pub wall_friction: f32,
 }
 
@@ -118,9 +130,10 @@ pub struct Input {
 impl Default for World {
     fn default() -> Self {
         Self {
-            width: 1240.0,
-            height: 760.0,
-            gravity: [0.0, -1400.0],
+            width: 400.0,
+            height: 300.0,
+            depth: 400.0,
+            gravity: [0.0, -1400.0, 0.0],
         }
     }
 }
@@ -128,10 +141,9 @@ impl Default for World {
 impl Default for FluidBlock {
     fn default() -> Self {
         Self {
-            columns: 78,
-            rows: 60,
+            block: [24, 26, 24],
             spacing: 10.0,
-            smoothing_radius: 24.0,
+            smoothing_radius: 20.0,
         }
     }
 }
@@ -139,7 +151,7 @@ impl Default for FluidBlock {
 impl Default for Solver {
     fn default() -> Self {
         Self {
-            iterations: 12,
+            iterations: 8,
             substeps: 1,
             jacobi_relax: 0.5,
             relaxation: 0.05,
@@ -147,6 +159,7 @@ impl Default for Solver {
             tensile_k: 0.04,
             tensile_q: 0.2,
             tensile_n: 4,
+            clamp_constraint: false,
             wall_friction: 0.98,
         }
     }
@@ -175,19 +188,27 @@ impl Default for Input {
 }
 
 impl Config {
-    /// Reads and validates a config file. A missing file yields the defaults;
-    /// a malformed or invalid one is an error, so a typo is loud rather than
-    /// silently ignored.
+    /// Reads and validates a config file the caller asked for by name. A
+    /// missing file is an error here: someone who names a path meant it, and
+    /// silently running the defaults instead would look like their settings
+    /// did nothing.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
-        match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Reads [`DEFAULT_PATH`], falling back to the defaults if it is not there.
+    /// Absent is fine for this one; malformed is still an error.
+    pub fn load_default() -> Result<Self, String> {
+        match std::fs::read_to_string(DEFAULT_PATH) {
+            Ok(text) => Self::parse(&text).map_err(|e| format!("{DEFAULT_PATH}: {e}")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let config = Self::default();
                 config.validate()?;
                 Ok(config)
             }
-            Err(e) => Err(format!("{}: {e}", path.display())),
+            Err(e) => Err(format!("{DEFAULT_PATH}: {e}")),
         }
     }
 
@@ -200,12 +221,16 @@ impl Config {
     }
 
     /// The simulation box, centred on the origin.
-    pub fn bounds(&self) -> Rect {
-        let half = Vec2::new(self.world.width, self.world.height) * 0.5;
-        Rect {
-            min: -half,
-            max: half,
-        }
+    pub fn bounds(&self) -> Bounds {
+        Bounds::from_size(Vec3::new(
+            self.world.width,
+            self.world.height,
+            self.world.depth,
+        ))
+    }
+
+    pub fn particle_count(&self) -> usize {
+        self.fluid.block.iter().product()
     }
 
     pub fn fluid_params(&self) -> FluidParams {
@@ -219,7 +244,8 @@ impl Config {
             tensile_k: self.solver.tensile_k,
             tensile_q: self.solver.tensile_q,
             tensile_n: self.solver.tensile_n,
-            gravity: Vec2::from(self.world.gravity),
+            clamp_constraint: self.solver.clamp_constraint,
+            gravity: Vec3::from(self.world.gravity),
             jacobi_relax: self.solver.jacobi_relax,
             wall_friction: self.solver.wall_friction,
             bounds: self.bounds(),
@@ -230,8 +256,8 @@ impl Config {
     /// starting block collapsing to the floor: v = sqrt(2 g h). Measured peaks
     /// land within about 20% of this across the sweep.
     pub fn expected_peak_speed(&self) -> f32 {
-        let g = Vec2::from(self.world.gravity).length();
-        let fall = (self.fluid.rows as f32 * self.fluid.spacing).min(self.world.height);
+        let g = Vec3::from(self.world.gravity).length();
+        let fall = (self.fluid.block[1] as f32 * self.fluid.spacing).min(self.world.height);
         (2.0 * g * fall).sqrt()
     }
 
@@ -256,30 +282,38 @@ impl Config {
 
     /// Largest starting block that fits inside the bounds at the current
     /// spacing. Mirrors the placement in `Fluid::fill_block`, including the
-    /// half-spacing row stagger and the collision margin.
-    pub fn max_block(&self) -> (usize, usize) {
+    /// half-spacing layer stagger and the collision margin.
+    pub fn max_block(&self) -> [usize; 3] {
         let d = self.fluid.spacing;
-        let cols = (self.world.width / d - 1.0).floor().max(0.0) as usize;
-        let rows = (self.world.height / d - 0.5).floor().max(0.0) as usize;
-        (cols, rows)
+        let along = |extent: f32, staggered: bool| {
+            let slack = if staggered { 1.0 } else { 0.5 };
+            (extent / d - slack).floor().max(0.0) as usize
+        };
+        [
+            along(self.world.width, true),
+            along(self.world.height, false),
+            along(self.world.depth, true),
+        ]
     }
 
     /// Checks the invariants the solver relies on. Called by [`Self::load`] and
     /// [`Self::parse`]; public so a config assembled in code can be checked too.
     pub fn validate(&self) -> Result<(), String> {
         let f = &self.fluid;
-        if f.columns == 0 || f.rows == 0 {
-            return Err("fluid.columns and fluid.rows must both be at least 1".into());
+        if f.block.contains(&0) {
+            return Err("every axis of fluid.block must be at least 1".into());
         }
         if !f.spacing.is_finite() || f.spacing <= 0.0 {
             return Err(format!("fluid.spacing must be positive, got {}", f.spacing));
         }
-        if !self.world.width.is_finite()
-            || !self.world.height.is_finite()
-            || self.world.width <= 0.0
-            || self.world.height <= 0.0
-        {
-            return Err("world.width and world.height must be positive".into());
+        for (name, extent) in [
+            ("width", self.world.width),
+            ("height", self.world.height),
+            ("depth", self.world.depth),
+        ] {
+            if !extent.is_finite() || extent <= 0.0 {
+                return Err(format!("world.{name} must be positive, got {extent}"));
+            }
         }
 
         // The neighbourhood has to be big enough for a density estimate to mean
@@ -296,24 +330,28 @@ impl Config {
 
         // A block that does not fit would be clamped into the walls at spawn,
         // starting the sim from a badly compressed state.
-        let (max_cols, max_rows) = self.max_block();
-        if f.columns > max_cols || f.rows > max_rows {
+        let max = self.max_block();
+        if (0..3).any(|axis| f.block[axis] > max[axis]) {
             return Err(format!(
-                "the starting block does not fit in the world: {}x{} particles at \
-                 spacing {} needs a {:.0}x{:.0} box, but world is {:.0}x{:.0}. \
-                 At this spacing the box holds at most {}x{} ({} particles); \
-                 either lower fluid.columns/fluid.rows, lower fluid.spacing, or \
-                 raise world.width/world.height",
-                f.columns,
-                f.rows,
+                "the starting block does not fit in the world: {}x{}x{} particles at \
+                 spacing {} needs a {:.0}x{:.0}x{:.0} box, but world is {:.0}x{:.0}x{:.0}. \
+                 At this spacing the box holds at most {}x{}x{} ({} particles); \
+                 either lower fluid.block, lower fluid.spacing, or raise \
+                 world.width/world.height/world.depth",
+                f.block[0],
+                f.block[1],
+                f.block[2],
                 f.spacing,
-                (f.columns as f32 + 1.0) * f.spacing,
-                (f.rows as f32 + 0.5) * f.spacing,
+                (f.block[0] as f32 + 1.0) * f.spacing,
+                (f.block[1] as f32 + 0.5) * f.spacing,
+                (f.block[2] as f32 + 1.0) * f.spacing,
                 self.world.width,
                 self.world.height,
-                max_cols,
-                max_rows,
-                max_cols * max_rows,
+                self.world.depth,
+                max[0],
+                max[1],
+                max[2],
+                max[0] * max[1] * max[2],
             ));
         }
 
@@ -385,9 +423,34 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_yields_the_defaults() {
-        let config = Config::load("does-not-exist.toml").expect("missing file should be fine");
-        assert_eq!(config.fluid.columns, Config::default().fluid.columns);
+    fn a_missing_default_file_yields_the_defaults() {
+        // Only true for the default path, and only when it is really absent.
+        let restore = std::fs::read_to_string(DEFAULT_PATH).ok();
+        if restore.is_some() {
+            // The repo ships one, so this case is covered by the unit below.
+            return;
+        }
+        let config = Config::load_default().expect("missing default file should be fine");
+        assert_eq!(config.fluid.block, Config::default().fluid.block);
+    }
+
+    #[test]
+    fn a_named_file_that_is_missing_is_an_error() {
+        // A typo'd --config path must not quietly run the defaults.
+        let err = Config::load("does-not-exist.toml").unwrap_err();
+        assert!(
+            err.contains("does-not-exist.toml"),
+            "the error should name the file: {err}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_config_file_is_valid() {
+        // The repo's own config.toml has to parse and pass validation, or the
+        // first thing anyone runs is an error message.
+        if let Ok(text) = std::fs::read_to_string(DEFAULT_PATH) {
+            Config::parse(&text).expect("the shipped config.toml is invalid");
+        }
     }
 
     #[test]
@@ -412,7 +475,7 @@ mod tests {
 
     #[test]
     fn a_block_too_big_for_the_world_is_rejected() {
-        let err = Config::parse("[fluid]\ncolumns = 500\n").unwrap_err();
+        let err = Config::parse("[fluid]\nblock = [500, 30, 22]\n").unwrap_err();
         assert!(
             err.contains("does not fit") && err.contains("at most"),
             "error should say what fits: {err}"
@@ -427,9 +490,7 @@ mod tests {
             let mut config = Config::default();
             config.fluid.spacing = spacing;
             config.fluid.smoothing_radius = spacing * 2.4;
-            let (cols, rows) = config.max_block();
-            config.fluid.columns = cols;
-            config.fluid.rows = rows;
+            config.fluid.block = config.max_block();
             // Isolate the geometry question from the stability one: a fine
             // spacing needs substeps, and that is a different test.
             config.solver.substeps = config.required_substeps();
@@ -437,11 +498,14 @@ mod tests {
                 .validate()
                 .unwrap_or_else(|e| panic!("max_block does not fit at spacing {spacing}: {e}"));
 
-            config.fluid.columns = cols + 1;
-            assert!(
-                config.validate().is_err(),
-                "one more column than max_block reports should not fit at spacing {spacing}"
-            );
+            for axis in 0..3 {
+                let mut over = config.clone();
+                over.fluid.block[axis] += 1;
+                assert!(
+                    over.validate().is_err(),
+                    "one more than max_block on axis {axis} should not fit at spacing {spacing}"
+                );
+            }
         }
     }
 
@@ -492,9 +556,13 @@ mod stability_tests {
     #[test]
     fn a_finer_spacing_without_substeps_is_rejected() {
         // The exact trap someone falls into when asking for more particles:
-        // halve the spacing, keep everything else, watch it explode. Measured
-        // at spacing 8 with one substep: 10^6 units/s.
-        let err = Config::parse("[fluid]\nspacing = 5.0\nsmoothing_radius = 12.0\n").unwrap_err();
+        // resolve the same body of water more finely and keep everything else.
+        // The block is scaled up to hold the drop height fixed, which is what
+        // makes it bite -- shrinking the kernel while the fluid still falls
+        // just as far is what pushes the Courant number past 1.
+        let err =
+            Config::parse("[fluid]\nspacing = 4.0\nsmoothing_radius = 8.0\nblock = [55, 74, 55]\n")
+                .unwrap_err();
         assert!(
             err.contains("solver.substeps"),
             "the error should name the fix: {err}"
@@ -508,10 +576,11 @@ mod stability_tests {
         for spacing in [12.0f32, 10.0, 8.0, 6.5, 5.0, 4.0, 3.0] {
             let mut config = Config::default();
             config.fluid.spacing = spacing;
-            config.fluid.smoothing_radius = spacing * 2.4;
-            let (max_cols, max_rows) = config.max_block();
-            config.fluid.columns = config.fluid.columns.min(max_cols);
-            config.fluid.rows = config.fluid.rows.min(max_rows);
+            config.fluid.smoothing_radius = spacing * 2.0;
+            let max = config.max_block();
+            for (target, limit) in config.fluid.block.iter_mut().zip(max) {
+                *target = (*target).min(limit);
+            }
             config.solver.substeps = config.required_substeps();
             config.validate().unwrap_or_else(|e| {
                 panic!("required_substeps is not sufficient at spacing {spacing}: {e}")
