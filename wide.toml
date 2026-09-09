@@ -1,0 +1,63 @@
+# Original wide swell tank: about 69,000 particles and a finer surface mesh.
+# Run with `cargo run --release -- wide.toml`; this costs more CPU time.
+#
+# Same swell as config.toml, seen across a much wider crest. For a longer
+# period and fewer, larger waves, see `groundswell.toml`: period cannot be
+# raised on its own, because the wavelength it implies has to fit the tank
+# and the water has to be half a wavelength deep.
+
+[scene]
+scenario = "wave"
+time_scale = 1.0
+replay_after = 0.0
+
+[swell]
+direction = 0.0
+height = 40.0
+period = 1.8
+
+[wave]
+water_depth = 190.0
+reef_height = 174.0
+reef_start = 0.30
+reef_width = 0.24
+reef_skew = 0.12
+beach_width = 0.22
+
+[world]
+width = 1100.0
+height = 320.0
+depth = 360.0
+gravity = [0.0, -700.0, 0.0]
+
+[fluid]
+block = [24, 26, 24]
+spacing = 8.0
+smoothing_radius = 16.0
+
+[solver]
+substeps = 1
+iterations = 16
+jacobi_relax = 0.5
+relaxation = 0.05
+viscosity = 0.02
+tensile_k = 0.0
+tensile_q = 0.2
+tensile_n = 4
+clamp_constraint = true
+wall_friction = 1.0
+
+[render]
+surface_resolution = 0.85
+show_bounds = false
+particle_scale = 2.4
+foam_speed = 700.0
+background = [0.67, 0.80, 0.87]
+deep_color = [0.015, 0.16, 0.20]
+mid_color = [0.08, 0.58, 0.53]
+foam_color = [0.92, 0.98, 1.00]
+vsync = true
+
+[input]
+mouse_radius = 110.0
+mouse_strength = 10000.0

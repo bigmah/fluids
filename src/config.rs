@@ -553,11 +553,22 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_config_file_is_valid() {
-        // The repo's own config.toml has to parse and pass validation, or the
-        // first thing anyone runs is an error message.
-        if let Ok(text) = std::fs::read_to_string(DEFAULT_PATH) {
-            Config::parse(&text).expect("the shipped config.toml is invalid");
+    fn every_shipped_preset_is_valid() {
+        // The repo's own presets have to parse and pass validation, or the
+        // first thing anyone runs is an error message. Every one of them, not
+        // just config.toml: a preset is only ever exercised by being run, and
+        // an invalid swell is refused at startup rather than clamped.
+        for entry in std::fs::read_dir(".").expect("the crate root is readable") {
+            let path = entry.expect("a readable directory entry").path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml")
+                || matches!(name.as_str(), "Cargo.toml" | "rust-toolchain.toml")
+            {
+                continue;
+            }
+            if let Err(e) = Config::load(&path) {
+                panic!("the shipped {name} is invalid: {e}");
+            }
         }
     }
 

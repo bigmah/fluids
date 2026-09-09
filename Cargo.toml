@@ -9,11 +9,10 @@ rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 
-# Bevy is unusably slow in an unoptimised build, but optimising our own crate
-# too would make edit-compile-run slow. Optimise the dependencies hard, this
-# crate lightly.
+# Optimise the solver as well as Bevy so a plain `cargo run` also has interactive
+# performance. The dev profile still retains debug information and assertions.
 [profile.dev]
-opt-level = 1
+opt-level = 3
 
 [profile.dev.package."*"]
 opt-level = 3

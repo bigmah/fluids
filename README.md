@@ -17,8 +17,8 @@ Set the incoming swell in [`config.toml`](config.toml), then restart the app:
 ```toml
 [swell]
 direction = 0.0  # direction of travel: +X toward the reef; positive turns toward +Z
-height = 40.0    # offshore crest-to-trough height, in world units
-period = 1.8     # simulation seconds between crests
+height = 105.0   # offshore crest-to-trough height, in world units
+period = 8.0     # simulation seconds between crests
 ```
 
 The old `wave.height`, `speed`, `curl`, `lip_thickness`, and `peel` controls have
@@ -38,7 +38,9 @@ There is no prescribed crest, curl, or lip trajectory. A damping beach beyond
 the reef reduces returning wash; particles remain in the tank.
 
 The water settles for one period and the generator ramps up over two more.
-Allow roughly 10–15 simulated seconds for the shipped swell to reach the shelf.
+Allow roughly 35 simulated seconds for the shipped swell to reach the shelf: the
+ramp is 24 of them at this period, and deep-water swell carries its energy at
+half the speed of its crests.
 Playback starts at normal speed with automatic replay disabled; `S` slows the
 simulation for inspection and `R` restarts it.
 
@@ -49,6 +51,26 @@ wavelength of water depth, resolved wave height/wavelength, and space between
 the generation zone, reef, and damping beach. For a meter-based setup, set
 `world.gravity = [0, -9.81, 0]` and choose all lengths, particle spacing, and input
 settings consistently. Playback speed does not change the physical period.
+
+How big the wave can be is not a free choice. Water cannot hold a wave steeper
+than about `height / wavelength = 1/7`, and wavelength is not a field: it comes
+out of period and gravity as `L = g T² / 2π`. So a bigger wave needs a longer
+wavelength, which needs a longer period, half a wavelength of water depth, and a
+tank wide enough to hold it — the shipped preset spends 480 units of depth and
+1400 of width on a 914-unit wavelength, and puts the height at 0.115 of it,
+just under the 0.12 validation allows.
+
+Gravity is the cheap half of that bill. At 700 units/s² this wavelength would
+arrive every 2.9 seconds; at 90 it takes 8, without another 7000 units of
+wavelength and 3500 of depth to simulate. It is the same physics at a different
+scale — against real gravity the preset is 0.109 m per world unit, a 100-metre,
+8-second, 11-metre swell breaking over a 3-metre shelf.
+
+For the original short-period swell across a much wider crest:
+
+```
+cargo run --release -- wide.toml
+```
 
 For the original dam break:
 
@@ -93,9 +115,23 @@ Slow motion scales the simulation clock. The renderer interpolates particle
 positions between fixed solver steps, so slowing playback does not increase
 viscosity or artificial pressure.
 
-Release mode matters. The solver and surface reconstruction both run on the CPU;
+The solver and surface reconstruction both run on the CPU;
 the title reports their costs separately. The historical solver benchmarks below
 refer to the dam break, before surface reconstruction was added.
+
+The default uses a `1400 × 720 × 140` tank with about 22,000 particles, against
+68,900 in `wide.toml`. Most of that saving is the narrower crest, and the rest is
+particle spacing: 14 units against 8, which is what pays for water deep enough to
+carry a 914-unit wavelength. The wave grew faster than the spacing did, so it is
+better resolved than the original — 65 particles along a wavelength and 7.5
+across the crest, against 45 and 5. Twelve solver iterations, checked by the wave
+regression tests. Surface reconstruction uses about 77,000 grid samples instead
+of 548,000; thin surface features are slightly less detailed.
+
+To tune cost, reduce `world.depth` (the span across the crest) or increase
+`render.surface_resolution`. Lowering particle spacing increases cost sharply;
+changing water depth or wave period also affects the physics and must pass
+validation.
 
 Everything tunable lives in [`config.toml`](config.toml), which is commented in
 full. Every field is optional, so a file naming one value is a legal config, and

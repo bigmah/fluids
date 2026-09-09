@@ -59,7 +59,11 @@ fn spawn_camera(mut commands: Commands, config: Res<Config>) {
             0.0,
         ),
         // Focus on the reef break; the dam break keeps the whole tank in view.
-        radius: size.length() * if wave { 0.55 } else { 1.05 },
+        // A wave is only ever about a tenth of its own wavelength tall, so a
+        // shot framing the whole tank makes any swell look small no matter how
+        // big it is. This one sits close enough to the reef that the offshore
+        // half runs off the sides. Scroll still zooms.
+        radius: size.length() * if wave { 0.38 } else { 1.05 },
         yaw: if wave { 0.58 } else { 0.7 },
         pitch: 0.30,
     };

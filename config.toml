@@ -3,49 +3,90 @@
 # Unknown or out-of-range fields are refused at startup rather than ignored.
 #
 # Pass a different file as the first argument: `cargo run --release -- big.toml`
+#
+# This is the big-wave tank: one long-period groundswell wave in the tank at a
+# time, breaking on an abrupt reef. `wide.toml` keeps the original short-period
+# swell across a wider crest. Size here is not a free parameter -- see [swell].
 
 [scene]
 scenario = "wave"
 time_scale = 1.0
 # Let successive swells travel to the reef. R restarts; S slows playback.
 replay_after = 0.0
+# Allow about 35 simulated seconds for the first wave to break: the generator
+# settles for one period and ramps over two more (24s at this period), and
+# deep-water swell then carries its energy at half the speed of its crests.
+# Raising time_scale skips ahead, at the cost of the wall-clock gap between
+# waves. It does not change the physical period.
 
 [swell]
 # Direction of TRAVEL in degrees: 0 = +X toward the reef, positive = toward +Z.
 # The offshore wavemaker supports -60..60 degrees; the reef does not rotate.
 direction = 0.0
-# Offshore crest-to-trough height in world units (not height above sea level).
-height = 40.0
-# Simulation seconds between crests. Longer periods also need deeper/wider water.
-period = 1.8
+
+# HOW BIG THE WAVE CAN BE. Offshore crest-to-trough height, in world units --
+# not height above sea level, and not a free choice. Water cannot hold a wave
+# steeper than about height/wavelength = 1/7; past that it breaks in open water
+# instead of travelling, so validation refuses anything over 0.12. At the
+# wavelength below, 0.12 is 110 units, and this sits just under it.
+#
+# So a bigger wave means a longer wavelength, and wavelength is not a field --
+# it comes out of period and gravity as L = g T^2 / 2pi. That is the whole
+# chain: bigger wave -> longer wavelength -> longer period, plus half a
+# wavelength of water depth and a tank wide enough to hold it.
+height = 105.0
+
+# Simulation seconds between crests. With the gravity below this is a 914-unit
+# wavelength, so the 1400-unit tank holds about one and a half waves: one
+# standing up on the reef while the next is still forming offshore.
+period = 8.0
 
 [wave]
 # Still-water depth offshore and rise of the submerged reef, in world units.
-water_depth = 190.0
-reef_height = 174.0
+# Depth is set by the swell, not by taste: validation wants half a wavelength
+# (457) under it, or the wave is already feeling the bottom when it is made.
+water_depth = 480.0
+# Two particle layers of water over the shelf. The wave arrives in 480 units of
+# water and has 28 to break into, which is what makes it stand up and throw
+# rather than spill.
+reef_height = 452.0
 # Fractions of world.width: a deep approach followed by a short, steep rise.
-reef_start = 0.30
+# The generation zone is 0.7 wavelengths long, so the reef cannot start before
+# 704 units; 0.52 of the tank puts it at 728 and leaves some free water first.
+reef_start = 0.52
+# 336 units of rise for 452 of height. Steeper than a beach by a long way: an
+# abrupt ledge is what jacks a deep-water wave up into a slab.
 reef_width = 0.24
 # Change in reef X per unit Z, so the lip can break progressively along the reef.
 reef_skew = 0.12
 # Shoreward damping beach, as a fraction of world.width. Reduces reflected wash.
-beach_width = 0.22
+# Damping goes by beach length against wavelength, so a long wave in a tight
+# tank is damped less than the original short-period one was.
+beach_width = 0.19
 
 [world]
-# World units are arbitrary: heights and depths share these units, time is seconds.
-# This preset's gravity sets its scale. For meters use gravity = [0, -9.81, 0]
-# and rescale all lengths, particle spacing, and input settings consistently.
-width = 1100.0
-height = 320.0
-depth = 360.0
-gravity = [0.0, -700.0, 0.0]
+# World units are arbitrary: heights and depths share these units, time is
+# seconds. Gravity sets the scale, and it is the cheap way to buy period: at
+# 700 units/s^2 this wavelength would arrive every 2.9 seconds, and stretching
+# it to 8 the honest way -- keeping gravity, growing the wave -- would mean a
+# 7000-unit wavelength, 3500 of depth, and ten times the water to simulate.
+#
+# Against real gravity this preset is 0.109 m per world unit: a 100-metre,
+# 8-second, 11-metre swell breaking over a 3-metre shelf. For a meter-based
+# setup, use gravity = [0, -9.81, 0] and rescale all lengths, particle spacing,
+# and input settings consistently.
+width = 1400.0
+height = 720.0
+depth = 140.0
+gravity = [0.0, -90.0, 0.0]
 
 [fluid]
 # DAM BREAK ONLY: particles along x, y and z in the starting block. It starts
 # in a corner and collapses, so more of it means a deeper pool.
 #
 # This is cubed, not squared: adding 20% to each side is 1.7x the particles.
-# Solver cost, measured on an M4 Pro (10 performance cores):
+# Solver cost at the dam break's own defaults, measured on an M4 Pro
+# (10 performance cores):
 #
 #   [18, 20, 18] =  6480 particles    4.6 ms/step   0.6% compression
 #   [24, 26, 24] = 14976 particles    7.1 ms/step   1.9% compression
@@ -63,14 +104,19 @@ block = [24, 26, 24]
 
 # RESOLUTION. Rest distance between neighbouring particles. Halving this packs
 # EIGHT times as many particles into the same water in 3D. It is the expensive
-# knob, and it does not stand alone -- see the two notes below.
-spacing = 8.0
+# knob, and it does not stand alone -- see the note below.
+#
+# Coarser than the original tank, which is what pays for the deeper water:
+# about 22,000 particles. The wave grew faster than the spacing did, so it is
+# better resolved than before -- 65 particles along a wavelength and 7.5 across
+# the crest, against 45 and 5.
+spacing = 14.0
 
 # How far a particle looks for neighbours. What matters is the RATIO to
 # `spacing`, which sets the neighbour count and with it the solver's whole
 # calibration, so change the two together. 2.0x is about 33 neighbours; the 2D
 # default of 2.4x would be 58 here, nearly twice the cost for no visible gain.
-smoothing_radius = 16.0
+smoothing_radius = 28.0
 
 [solver]
 # Solver steps per frame. The one to raise when you lower `spacing` or deepen
@@ -80,9 +126,10 @@ smoothing_radius = 16.0
 # combination and tells you what to set this to.
 substeps = 1
 
-# Jacobi iterations per substep. The deeper wave tank needs more passes than
-# the dam break to carry pressure through the water and preserve the swell.
-iterations = 16
+# Jacobi iterations per substep. The water column is 34 layers deep here
+# against 24 in the original tank, but at this gravity it carries a third of
+# the hydrostatic load, so twelve passes still hold the swell together.
+iterations = 12
 
 # Under-relaxation on the positional correction. Jacobi updates every particle
 # against stale neighbours, so applying the full correction overshoots and the
@@ -114,17 +161,20 @@ clamp_constraint = true
 wall_friction = 1.0
 
 [render]
-# Continuous 3D water surface. Smaller cells resolve the lip more finely but
-# cost more CPU time. P toggles the particle diagnostic; B toggles tank bounds.
-surface_resolution = 0.85
+# Mesh cell size as a multiple of spacing, so it follows the resolution above.
+# Smaller cells resolve the lip more finely but cost more CPU time.
+# P toggles the particle diagnostic; B toggles tank bounds.
+surface_resolution = 1.1
 show_bounds = false
 # Spray droplet size multiplier; 2.4 is the reference size. This does not
 # change the reconstructed water surface.
 particle_scale = 2.4
 
 # Foam visibility calibration (legacy field name). Lower makes more of the
-# solver's aeration indicator visible. Fast coherent water stays clear.
-foam_speed = 700.0
+# solver's aeration indicator visible. Fast coherent water stays clear. Speeds
+# go as the square root of gravity, so this is the original 700 scaled by
+# sqrt(90/700) to keep the same water reading as clear or aerated.
+foam_speed = 250.0
 
 # sRGB, 0..1. Deep absorption/scattering, sunlit water, and aerated foam.
 background = [0.67, 0.80, 0.87]
@@ -142,14 +192,14 @@ vsync = true
 #
 # A radial push in an incompressible fluid is mostly cancelled by the density
 # constraint -- only the free surface is free to move -- so the strength is far
-# larger than the speeds it produces. Measured, held at this radius:
+# larger than the speeds it produces. Measured at the original 700 gravity,
+# held at a 110 radius:
 #
 #    4000 -> peak  604 u/s, surface lifts 13 units
 #   10000 -> peak  ~900 u/s
 #   30000 -> peak 1984 u/s
 #
-# Past about 1140 u/s a particle crosses more than a kernel radius per step and
-# outruns its own neighbour list, so shoving harder than that is self-defeating
-# unless you raise solver.substeps to match.
-mouse_radius = 110.0
-mouse_strength = 10000.0
+# Radius follows the spacing and strength is an acceleration, so it follows
+# gravity: both are scaled from those numbers rather than re-measured.
+mouse_radius = 190.0
+mouse_strength = 1300.0

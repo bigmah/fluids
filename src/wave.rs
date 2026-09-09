@@ -309,13 +309,20 @@ mod tests {
     #[test]
     fn wavemaker_obeys_height_period_and_direction() {
         let c = config();
-        let make = |s| Wavemaker::new(c.wave, s, c.bounds(), 700.0);
+        // The preset's own gravity: with a fixed 700 here, a preset tuned at any
+        // other scale gets a wavelength that does not match its tank, and the
+        // generation zone silently swallows the reef.
+        let make = |s| Wavemaker::new(c.wave, s, c.bounds(), -c.world.gravity[1]);
         let a = make(c.swell);
         let b = make(Swell {
             height: c.swell.height * 2.0,
             ..c.swell
         });
-        let p = Vec3::new(-400.0, c.wave.water_level(c.bounds()), 40.0);
+        let p = Vec3::new(
+            c.bounds().min.x + c.world.width * 0.2,
+            c.wave.water_level(c.bounds()),
+            c.world.depth * 0.3,
+        );
         let t = 4.25 * c.swell.period;
         assert_eq!(a.orbital_velocity(p, 0.0), Vec3::ZERO);
         assert!((b.orbital_velocity(p, t) - 2.0 * a.orbital_velocity(p, t)).length() < 1e-5);
@@ -420,9 +427,14 @@ mod tests {
     fn incoming_swell_reaches_the_reef_and_resets_cleanly() {
         let mut c = config();
         // A narrow flume retains the shipped cross-section and particle resolution.
-        c.world.depth = 80.0;
+        c.world.depth = 8.0 * c.fluid.spacing;
         c.wave.reef_skew = 0.0;
         c.validate().unwrap();
+        let shelf_x = c.bounds().min.x
+            + c.world.width * (c.wave.reef_start + c.wave.reef_width)
+            + c.fluid.spacing;
+        let offshore_x =
+            c.bounds().min.x + 0.85 * c.swell.wavelength(-c.world.gravity[1], c.wave.water_depth);
         let mut f = Fluid::new(c.fluid_params());
         c.reset_fluid(&mut f);
         let initial = f.pos.clone();
@@ -432,7 +444,7 @@ mod tests {
             crate::surface::Surface::new(c.bounds(), c.fluid.spacing, c.render.surface_resolution);
         surface.rebuild(&f);
         let probe = Vec3::new(
-            50.0,
+            shelf_x,
             c.wave.water_level(c.bounds()) + c.fluid.spacing * 2.0,
             0.0,
         );
@@ -440,10 +452,18 @@ mod tests {
             surface.density_at(probe) < crate::surface::ISO,
             "a crest must not exist at reset"
         );
+        // The schedule belongs to the swell, not to a step count: the generator
+        // settles for a period and ramps over two more, and the first crest then
+        // needs about another to cross the tank, since deep-water swell carries
+        // its energy at half the speed of its crests. Measure the periods after
+        // that, in both this run and the still-water control below.
+        let period_steps = (60.0 * c.swell.period).round() as u32;
+        let warmup = 4 * period_steps;
+        let run = 6 * period_steps;
         let mut near_min = f32::INFINITY;
         let mut near_max = f32::NEG_INFINITY;
         let mut peak = 0.0f32;
-        for step in 1..=900 {
+        for step in 1..=run {
             f.step(1.0 / 60.0);
             peak = peak.max(f.max_speed());
             assert!(f.pos.iter().all(|p| p.is_finite()
@@ -451,8 +471,8 @@ mod tests {
                 && p.cmple(c.bounds().max).all()
                 && p.y + 1e-3 >= c.wave.floor(*p, c.bounds()) + c.fluid.spacing * 0.5
                 && p.x + 1e-3 >= c.bounds().min.x + c.fluid.spacing * 0.5));
-            if step > 360 {
-                let near = gauge(&f, 50.0);
+            if step > warmup {
+                let near = gauge(&f, shelf_x);
                 near_min = near_min.min(near);
                 near_max = near_max.max(near);
             }
@@ -480,10 +500,10 @@ mod tests {
         c.reset_fluid(&mut f);
         let mut still_min = f32::INFINITY;
         let mut still_max = f32::NEG_INFINITY;
-        for step in 1..=900 {
+        for step in 1..=run {
             f.step(1.0 / 60.0);
-            if step > 360 {
-                let near = gauge(&f, 50.0);
+            if step > warmup {
+                let near = gauge(&f, shelf_x);
                 still_min = still_min.min(near);
                 still_max = still_max.max(near);
             }
@@ -494,7 +514,7 @@ mod tests {
             still_max - still_min
         );
         assert!(
-            (gauge(&f, -250.0) - c.wave.water_level(c.bounds())).abs() < 1.5 * c.fluid.spacing,
+            (gauge(&f, offshore_x) - c.wave.water_level(c.bounds())).abs() < 1.5 * c.fluid.spacing,
             "solid boundary support must preserve offshore water depth"
         );
     }
