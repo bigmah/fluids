@@ -85,8 +85,8 @@ spilling below and a collapsing bore above. The preset sits at 0.25; the same
 wave on a 1:5 slope (0.39) collapses without a lip. The lip throws about 13
 simulated seconds in, first at the far wall: the reef is skewed slightly, so the
 barrel peels across the 1200-unit crest toward the camera. It is about 1.3
-million particles: a solver step takes about 60 ms on an M4 Pro's GPU and 400 on
-its CPU, so the break takes under a minute to arrive on the GPU; `world.depth = 200` is the same break
+million particles: a solver step takes about 40 ms on an M4 Pro's GPU and 230 on
+its CPU, so the break takes about half a minute to arrive on the GPU; `world.depth = 200` is the same break
 across a narrow strip at a sixth of the cost.
 
 For the original short-period swell across a much wider crest:
@@ -133,6 +133,7 @@ Useful settings in `config.toml`:
 | `scene.time_scale` | Playback speed, without changing the physics timestep |
 | `scene.replay_after` | Replay interval in simulated seconds; `0` disables it |
 | `solver.backend` | `gpu` (the default) or `cpu`; see [On the GPU](#on-the-gpu) |
+| `solver.chebyshev` | Accelerates the Jacobi iterations; `0` is off. See [How it works](#how-it-works) |
 | `render.surface_resolution` | Mesh voxel size / particle spacing; smaller costs more to rebuild |
 | `render.foam_speed` | Foam visibility calibration; lower makes more foam visible |
 
@@ -223,13 +224,24 @@ collisions and constraint corrections energy-safe for free — a particle that
 gets pushed out of a wall simply *has* less velocity afterwards, with no
 restitution coefficient to tune.
 
-Three details that are load-bearing:
+Four details that are load-bearing:
 
 **Under-relaxation.** The constraint is solved with Jacobi iteration, which
 updates every particle against stale neighbours. Applying the full correction
 overshoots and the fluid explodes; the first version of this did exactly that,
 reaching 10⁶ units/s within two seconds. `jacobi_relax` scales the correction
 down, and values above 0.55 are refused.
+
+**Chebyshev acceleration.** Under-relaxed Jacobi carries pressure about one
+particle per pass, so a deep column takes many passes to hold up. With
+`solver.chebyshev` set, each pass's result is pushed past itself, away from
+where the particles were two passes back, by a weight that climbs from 1 toward
+`2 / (1 + sqrt(1 - ρ²))` (Wang, *A Chebyshev Semi-Iterative Approach for
+Accelerating Projective and Position-based Dynamics*, 2015), where ρ estimates
+how slowly plain Jacobi converges. `slab.toml` gets more out of eight passes this
+way than it got from sixteen plain ones. Set ρ too high and the extrapolation
+feeds itself: 0.97 blows the slab apart at eight passes, so values above 0.95
+are refused. `iteration_accuracy` is how to choose it for another scene.
 
 **Calibrated rest density.** Rather than hard-coding a target density, the
 solver sums the kernel over an ideal lattice at startup and uses that
@@ -308,24 +320,23 @@ for a solver step and `surface_cost` for rebuilding the surface, CPU against GPU
 |---|---|---|---|
 | `config.toml` | 22,078 | 11.8 → 3 ms | 3.5 → 2.9 ms |
 | `wide.toml` | 68,909 | 30.5 → 4.5 ms | 13.6 → 4.9 ms |
-| `slab.toml` | 1,306,995 | 385 → 60 ms | 80 → 18 ms |
+| `slab.toml` | 1,306,995 | 231 → 38 ms | 80 → 18 ms |
 
 A small tank is mostly fixed cost on the GPU — dozens of dispatches and a wait
 per step — so the gain grows with the particle count. The CPU renderer also
 uploads the rebuilt mesh every frame, a million triangles at `slab.toml`'s scale,
 and draws its spray as a million entities; with the GPU backend neither leaves
-the GPU. In the app, `slab.toml` reaches 17 simulated seconds in 90 seconds of
-wall-clock time on the GPU, against 2 on the CPU. Four fifths of a GPU step is
-the Jacobi iterations (`profile_phases` breaks it down), so `solver.iterations`
-is the knob that moves it.
+the GPU. Three quarters of a GPU step is the Jacobi iterations (`profile_phases`
+breaks it down), so `solver.iterations` is the knob that moves it, and
+`solver.chebyshev` is what lets it come down without losing accuracy.
 
 Those iterations are bound by memory, not arithmetic. Dropping the solid-support
 maths or the artificial-pressure branch from them saves nothing measurable, but
 each neighbour's multiplier used to be a load from a buffer of its own, and that
 load cost more than the kernels. So `solve_lambda` writes each multiplier beside
 the position it was computed at, and `solve_delta` reads both in one load and
-applies its correction in the same pass, taking a `slab.toml` step from 73 ms
-to 60.
+applies its correction in the same pass, which took a sixteen-iteration
+`slab.toml` step from 73 ms to 59.
 
 ## Turning the particle count up
 
@@ -369,7 +380,8 @@ but the fluid is expected to peak near 910 units/s. Set solver.substeps = 2
 One trap worth naming, because it looks like an obvious optimisation: **do not
 cut `solver.iterations` to pay for the extra substeps.** Jacobi iteration
 carries pressure roughly one particle per pass, so a finer grid makes the pool
-deeper *in particles* and needs more passes, not fewer.
+deeper *in particles* and needs more passes, not fewer. Chebyshev acceleration
+(see [How it works](#how-it-works)) is how to get the same accuracy from fewer.
 
 ## What this does not do
 
@@ -522,13 +534,18 @@ cargo test --release speedup -- --ignored --nocapture          # CPU against GPU
 cargo test --release sensitivity -- --ignored --nocapture      # GPU drift against the CPU's own
 cargo test --release profile_phases -- --ignored --nocapture   # GPU time per solver pass
 cargo test --release sustained -- --ignored --nocapture        # GPU step cost as the break develops
+cargo test --release iteration_accuracy -- --ignored --nocapture  # slab accuracy against iterations
 cargo test --release surface_cost -- --ignored --nocapture     # CPU against GPU surface rebuild
 ```
 
 `scaling` produced the table above. `sweep` is how the defaults were chosen: it
 reports peak speed, compression and bulk density across solver settings,
 alongside the per-step cost, so the accuracy/speed trade is visible in one
-table.
+table. `iteration_accuracy` does the same for the slab on the GPU, plain or
+accelerated: how far still water sinks, compression, when and where the lip
+throws, and speed through the splash. It also runs a twin from a nudged start,
+because the break is chaotic, and two runs whose surfaces differ by less than
+that pair's do cannot be told apart.
 
 ## Toolchain
 

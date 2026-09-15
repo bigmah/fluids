@@ -29,6 +29,9 @@ const SIM_HZ: f32 = 60.0;
 /// config that merely *approaches* the cliff is refused rather than shipped.
 const COURANT_LIMIT: f32 = 0.95;
 
+/// Largest `solver.chebyshev` accepted. See the check in `validate`.
+const CHEBYSHEV_LIMIT: f32 = 0.95;
+
 #[derive(Debug, Clone, Default, Deserialize, Resource)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -129,6 +132,11 @@ pub struct Solver {
     /// Under-relaxation on the positional correction. See [`FluidParams`];
     /// 0.5 is a ceiling, not a starting point.
     pub jacobi_relax: f32,
+    /// Chebyshev acceleration: an estimate of the Jacobi iterations' spectral
+    /// radius, below 1, or 0 for plain Jacobi.
+    pub chebyshev: f32,
+    /// Plain iterations before the acceleration starts.
+    pub chebyshev_delay: u32,
     pub relaxation: f32,
     pub viscosity: f32,
     pub tensile_k: f32,
@@ -210,6 +218,8 @@ impl Default for Solver {
             iterations: 8,
             substeps: 1,
             jacobi_relax: 0.5,
+            chebyshev: 0.0,
+            chebyshev_delay: 1,
             relaxation: 0.05,
             viscosity: 0.08,
             tensile_k: 0.04,
@@ -315,6 +325,8 @@ impl Config {
             clamp_constraint: self.solver.clamp_constraint,
             gravity: Vec3::from(self.world.gravity),
             jacobi_relax: self.solver.jacobi_relax,
+            chebyshev: self.solver.chebyshev,
+            chebyshev_delay: self.solver.chebyshev_delay,
             wall_friction: self.solver.wall_friction,
             bounds: self.bounds(),
         }
@@ -479,6 +491,22 @@ impl Config {
                  above 0.6 diverge for some iteration counts",
                 s.jacobi_relax
             ));
+        }
+        // Also measured, on the slab flume with `iteration_accuracy`: 0.97 blows
+        // up at 8 iterations and starts adding energy to the splash at 6.
+        if !s.chebyshev.is_finite() || !(0.0..=CHEBYSHEV_LIMIT).contains(&s.chebyshev) {
+            return Err(format!(
+                "solver.chebyshev must be in [0, {CHEBYSHEV_LIMIT}]; got {}. It estimates \
+                 the Jacobi iterations' spectral radius, and 0.97 blows the slab apart",
+                s.chebyshev
+            ));
+        }
+        if s.chebyshev_delay == 0 {
+            return Err(
+                "solver.chebyshev_delay must be at least 1: the first iteration has no \
+                 earlier one to extrapolate from"
+                    .into(),
+            );
         }
         if !s.relaxation.is_finite() || s.relaxation <= 0.0 {
             return Err("solver.relaxation must be positive".into());
@@ -662,6 +690,14 @@ mod tests {
     fn a_diverging_relaxation_is_rejected() {
         let err = Config::parse("[solver]\njacobi_relax = 0.9\n").unwrap_err();
         assert!(err.contains("diverge"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_unstable_chebyshev_is_rejected() {
+        let err = Config::parse("[solver]\nchebyshev = 0.98\n").unwrap_err();
+        assert!(err.contains("chebyshev"), "unhelpful error: {err}");
+        assert!(Config::parse("[solver]\nchebyshev_delay = 0\n").is_err());
+        assert!(Config::parse("[solver]\nchebyshev = nan\n").is_err());
     }
 
     #[test]

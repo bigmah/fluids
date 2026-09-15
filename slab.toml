@@ -1,9 +1,9 @@
 # One big wave, plunging along a wide crest over a shallow reef. Run with
 # `cargo run --release -- slab.toml`. The lip throws about 13 simulated seconds
 # in, with a barrel the whole way across by 14; S slows playback for it. This
-# costs far more than config.toml: about 60 ms per solver step on an M4 Pro's
-# GPU, 400 on its CPU, so the break takes under a minute to arrive on the GPU
-# and ten on the CPU. For a video, see
+# costs far more than config.toml: about 40 ms per solver step on an M4 Pro's
+# GPU, 230 on its CPU, so the break takes about half a minute to arrive on the
+# GPU and three on the CPU. For a video, see
 # the capture section of the README. For quick experiments, world.depth = 200
 # is the same break across a narrow strip, at a sixth of the cost.
 #
@@ -71,7 +71,17 @@ smoothing_radius = 16.0
 [solver]
 backend = "gpu"
 substeps = 1
-iterations = 16
+# Eight Chebyshev-accelerated iterations hold the water better than sixteen
+# plain ones did. On the flume in `iteration_accuracy`, still water sinks as
+# far (0.049 of a spacing against 0.043), compression is lower (0.13% against
+# 0.18%), and the lip throws at the same time and place, within what a start
+# nudged by rounding moves them, with the same speed and compression through
+# the splash. The whole crest agrees, at 38 ms a step against 59. 0.97 blows up
+# at eight iterations, so 0.9 leaves room. Six at 0.95 with a delay of 2 also
+# matches sixteen plain iterations, for a little less margin.
+iterations = 8
+chebyshev = 0.9
+chebyshev_delay = 1
 jacobi_relax = 0.5
 relaxation = 0.05
 viscosity = 0.02

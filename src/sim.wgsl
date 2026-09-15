@@ -20,6 +20,7 @@ const WAVE: u32 = 1u;
 const SINGLE: u32 = 2u;
 const CLAMP: u32 = 4u;
 const MAKER: u32 = 8u;
+const CHEBYSHEV: u32 = 16u;
 
 // Mirrors `GpuParams` in `sim_gpu.rs`: the vec4s first, then scalars only, so the
 // uniform layout and the Rust struct agree without implicit padding.
@@ -91,9 +92,18 @@ struct Level {
     down: u32,
 }
 
+// One Jacobi iteration's Chebyshev weight; see `chebyshev_weights` in `sim.rs`.
+struct Sweep {
+    omega: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<uniform> level: Level;
 @group(0) @binding(2) var<storage, read_write> positions: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> sweep: Sweep;
 @group(0) @binding(4) var<storage, read_write> velocities: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> predicted: array<vec4<f32>>;
 // xyz: the positions λ was computed at; w: λ. A neighbour's position and
@@ -116,6 +126,8 @@ struct Level {
 @group(0) @binding(19) var<storage, read_write> max_neighbors: array<atomic<u32>>;
 @group(0) @binding(20) var<storage, read_write> stats: array<vec4<f32>>;
 @group(0) @binding(21) var<storage, read_write> top: array<vec4<f32>>;
+// The predictions one Jacobi iteration back, which Chebyshev extrapolates from.
+@group(0) @binding(22) var<storage, read_write> earlier: array<vec4<f32>>;
 // A per-particle buffer being renumbered into grid order: a vec4 one into
 // `scratch`, or a scalar one, copied as bits, into `gathered`.
 @group(0) @binding(23) var<storage, read_write> vectors: array<vec4<f32>>;
@@ -556,6 +568,16 @@ fn solve_delta(@builtin(global_invocation_id) id: vec3<u32>) {
     var p = clamp(pi + delta, params.wall_min.xyz, params.wall_max.xyz);
     if has(WAVE) {
         p = project(p);
+    }
+    if has(CHEBYSHEV) {
+        if sweep.omega != 1.0 {
+            let e = earlier[i].xyz;
+            p = clamp(e + (p - e) * sweep.omega, params.wall_min.xyz, params.wall_max.xyz);
+            if has(WAVE) {
+                p = project(p);
+            }
+        }
+        earlier[i] = vec4<f32>(pi, 0.0);
     }
     predicted[i] = vec4<f32>(p, 0.0);
 }

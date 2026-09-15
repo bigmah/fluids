@@ -121,6 +121,11 @@ pub struct FluidParams {
     /// particle against stale neighbours, so applying the full correction
     /// overshoots and rings; Gauss-Seidel would not need this.
     pub jacobi_relax: f32,
+    /// Chebyshev acceleration of the Jacobi iterations: an estimate of their
+    /// spectral radius, or 0 for plain Jacobi. See [`chebyshev_weights`].
+    pub chebyshev: f32,
+    /// Plain Jacobi iterations before the acceleration starts; at least 1.
+    pub chebyshev_delay: u32,
     /// Resolve compression only, leaving under-dense particles alone.
     ///
     /// A particle near the free surface has part of its kernel sticking out
@@ -249,6 +254,8 @@ pub struct Fluid {
     pred: Vec<Vec3>,
     lambda: Vec<f32>,
     delta: Vec<Vec3>,
+    /// The predictions one Jacobi iteration back, which Chebyshev extrapolates from.
+    earlier: Vec<Vec3>,
     vel_scratch: Vec<Vec3>,
     boundary: Vec<(f32, Vec3)>,
     pub(crate) kernels: Kernels,
@@ -283,6 +290,7 @@ impl Fluid {
             pred: Vec::new(),
             lambda: Vec::new(),
             delta: Vec::new(),
+            earlier: Vec::new(),
             vel_scratch: Vec::new(),
             boundary: Vec::new(),
             grid: Grid::new(params.bounds, params.smoothing_radius),
@@ -374,6 +382,7 @@ impl Fluid {
         self.pred = vec![Vec3::ZERO; n];
         self.lambda = vec![0.0; n];
         self.delta = vec![Vec3::ZERO; n];
+        self.earlier = vec![Vec3::ZERO; n];
         self.vel_scratch = vec![Vec3::ZERO; n];
         self.boundary = vec![(0.0, Vec3::ZERO); n];
         // These describe the configuration we just threw away. Leaving them
@@ -473,8 +482,9 @@ impl Fluid {
         self.build_neighbors();
 
         // 3. Jacobi-solve the density constraint.
-        for _ in 0..self.params.iterations {
-            self.solve_density();
+        let weights = chebyshev_weights(&self.params);
+        for omega in weights {
+            self.solve_density(omega);
         }
 
         // 4. Derive velocity from the positions the solver settled on, which is
@@ -600,7 +610,7 @@ impl Fluid {
         self.build_neighbors();
     }
 
-    fn solve_density(&mut self) {
+    fn solve_density(&mut self, omega: f32) {
         let inv_rho0 = 1.0 / self.rest_density;
         let kernels = self.kernels;
         let epsilon = self.epsilon;
@@ -693,11 +703,20 @@ impl Fluid {
         self.pred
             .par_iter_mut()
             .zip(delta.par_iter())
-            .for_each(|(p, d)| {
-                *p = (*p + *d).clamp(min, max);
+            .zip(self.earlier.par_iter_mut())
+            .for_each(|((p, d), earlier)| {
+                let old = *p;
+                *p = (old + *d).clamp(min, max);
                 if let Some(wave) = wave {
                     wave.project(p, bounds, margin);
                 }
+                if omega != 1.0 {
+                    *p = (*earlier + (*p - *earlier) * omega).clamp(min, max);
+                    if let Some(wave) = wave {
+                        wave.project(p, bounds, margin);
+                    }
+                }
+                *earlier = old;
             });
     }
 
@@ -847,6 +866,30 @@ impl Fluid {
             .map(|v| v.length())
             .reduce(|| 0.0f32, f32::max)
     }
+}
+
+/// The extrapolation weight for each Jacobi iteration of a substep, from Wang,
+/// "A Chebyshev Semi-Iterative Approach for Accelerating Projective and
+/// Position-based Dynamics" (2015). Each iteration's result `p` is pushed past
+/// itself to `earlier + omega * (p - earlier)`, `earlier` being the positions
+/// two iterations back; `omega` climbs from 1 toward `2 / (1 + sqrt(1 - rho^2))`.
+/// Weights of exactly 1 leave an iteration plain Jacobi.
+pub(crate) fn chebyshev_weights(params: &FluidParams) -> Vec<f32> {
+    let rho2 = params.chebyshev * params.chebyshev;
+    let delay = params.chebyshev_delay.max(1);
+    let mut omega = 1.0f32;
+    (0..params.iterations)
+        .map(|k| {
+            if params.chebyshev <= 0.0 || k < delay {
+                omega = 1.0;
+            } else if k == delay {
+                omega = 2.0 / (2.0 - rho2);
+            } else {
+                omega = 4.0 / (4.0 - rho2 * omega);
+            }
+            omega
+        })
+        .collect()
 }
 
 /// Density and constraint-gradient magnitude a particle would see at the centre

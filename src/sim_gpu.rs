@@ -14,7 +14,7 @@
 //! largest neighbourhood seen is tracked so tests can prove it never was.
 
 use crate::gpu::{Binding, Gpu, Kernel, cast};
-use crate::sim::{Bounds, Fluid};
+use crate::sim::{Bounds, Fluid, chebyshev_weights};
 use bevy::log::warn;
 use bevy::math::Vec3;
 use bevy::prelude::Resource;
@@ -37,6 +37,7 @@ const WAVE: u32 = 1;
 const SINGLE: u32 = 2;
 const CLAMP: u32 = 4;
 const MAKER: u32 = 8;
+const CHEBYSHEV: u32 = 16;
 
 /// `Params` in `sim.wgsl`: vec4s first, then scalars, so nothing is padded
 /// implicitly on either side.
@@ -109,12 +110,25 @@ struct Level {
     down: u32,
 }
 
+/// `Sweep` in `sim.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Sweep {
+    omega: f32,
+    _pad: [f32; 3],
+}
+
+fn sweep_align(gpu: &Gpu) -> u64 {
+    gpu.device.limits().min_uniform_buffer_offset_alignment as u64
+}
+
 /// A binding in `sim.wgsl`. The discriminant is the binding number.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Slot {
     Params = 0,
     Level = 1,
     Positions = 2,
+    Sweep = 3,
     Velocities = 4,
     Predicted = 5,
     Lambdas = 6,
@@ -132,6 +146,7 @@ enum Slot {
     MaxNeighbors = 19,
     Stats = 20,
     Top = 21,
+    Earlier = 22,
     Vectors = 23,
     Scalars = 24,
     Gathered = 25,
@@ -249,11 +264,13 @@ impl Pass {
             ],
             Pass::Delta => &[
                 Params,
+                Sweep,
                 Predicted,
                 Neighbors,
                 NeighborCount,
                 Boundary,
                 Lambdas,
+                Earlier,
             ],
             Pass::Velocity => &[Params, Predicted, Positions, Velocities],
             Pass::Viscosity => &[
@@ -440,6 +457,9 @@ struct Buffers {
     max_neighbors: Buffer,
     stats: Buffer,
     top: Buffer,
+    earlier: Buffer,
+    /// Each Jacobi iteration's [`Sweep`], addressed by dynamic offset.
+    sweeps: Buffer,
     /// The particle, in `Fluid`'s numbering, each slot holds; see
     /// [`GpuFluid::encode_renumber`].
     ids: Buffer,
@@ -470,6 +490,12 @@ impl Buffers {
             Slot::MaxNeighbors => self.max_neighbors.as_entire_binding(),
             Slot::Stats => self.stats.as_entire_binding(),
             Slot::Top => self.top.as_entire_binding(),
+            Slot::Earlier => self.earlier.as_entire_binding(),
+            Slot::Sweep => BindingResource::Buffer(BufferBinding {
+                buffer: &self.sweeps,
+                offset: 0,
+                size: BufferSize::new(size_of::<Sweep>() as u64),
+            }),
             Slot::Gathered => self.gathered.as_entire_binding(),
             Slot::Cells | Slot::GridCount | Slot::GridCursor => {
                 unreachable!("{slot:?} is bound by the grid")
@@ -541,6 +567,10 @@ impl GpuFluid {
                                 size: size_of::<Level>() as u64,
                                 dynamic: true,
                             },
+                            Slot::Sweep => Binding::Uniform {
+                                size: size_of::<Sweep>() as u64,
+                                dynamic: true,
+                            },
                             _ => Binding::Storage,
                         };
                         (slot as u32, kind)
@@ -603,6 +633,13 @@ impl GpuFluid {
             max_neighbors: storage_buffer(gpu, "max neighbours", 4),
             stats: storage_buffer(gpu, "stats", 16 * reduce_size as u64),
             top: storage_buffer(gpu, "top", 16),
+            earlier: storage_buffer(gpu, "earlier predictions", 16 * n64),
+            sweeps: gpu.device.create_buffer(&BufferDescriptor {
+                label: Some("chebyshev weights"),
+                size: fluid.params.iterations.max(1) as u64 * sweep_align(gpu),
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
             ids: storage_buffer(gpu, "particle ids", 4 * n64),
             gathered: storage_buffer(gpu, "gathered scalars", 4 * n64),
             reduce_levels: Levels::new(gpu, reduce_size, false),
@@ -955,9 +992,9 @@ impl GpuFluid {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
             self.run(&mut pass, Pass::Neighbors, n);
             // 3. Jacobi iterations.
-            for _ in 0..iterations {
+            for k in 0..iterations {
                 self.run(&mut pass, Pass::Lambda, n);
-                self.run(&mut pass, Pass::Delta, n);
+                self.run_delta(&mut pass, k);
             }
             // 4. Velocity, 5. viscosity.
             self.run(&mut pass, Pass::Velocity, n);
@@ -1121,6 +1158,19 @@ impl GpuFluid {
         dispatch(pass, count);
     }
 
+    /// The correction of Jacobi iteration `k`, with its Chebyshev weight.
+    fn run_delta(&self, pass: &mut ComputePass, k: u32) {
+        let b = &self.buffers;
+        assert!(
+            (k as u64 + 1) * sweep_align(&self.gpu) <= b.sweeps.size(),
+            "more iterations than the weights were sized for"
+        );
+        let group = self.bind_groups[Pass::Delta as usize].as_ref().unwrap();
+        pass.set_pipeline(&self.kernels[Pass::Delta as usize].pipeline);
+        pass.set_bind_group(0, group, &[(k as u64 * sweep_align(&self.gpu)) as u32]);
+        dispatch(pass, b.n as u32);
+    }
+
     fn run_levels(&self, pass: &mut ComputePass, which: Pass) {
         let group = self.bind_groups[which as usize].as_ref().unwrap();
         pass.set_pipeline(&self.kernels[which as usize].pipeline);
@@ -1148,6 +1198,9 @@ impl GpuFluid {
         }
         if p.clamp_constraint {
             flags |= CLAMP;
+        }
+        if p.chebyshev > 0.0 {
+            flags |= CHEBYSHEV;
         }
         let wave = fluid.wave.unwrap_or_default();
         let maker = fluid.wavemaker;
@@ -1214,6 +1267,15 @@ impl GpuFluid {
         self.gpu
             .queue
             .write_buffer(&b.params, 0, bytemuck::bytes_of(&params));
+        let align = sweep_align(&self.gpu) as usize;
+        let slots = b.sweeps.size() as usize / align;
+        let mut table = vec![0u8; b.sweeps.size() as usize];
+        for (k, omega) in chebyshev_weights(p).into_iter().take(slots).enumerate() {
+            let sweep = Sweep { omega, _pad: [0.0; 3] };
+            table[k * align..k * align + size_of::<Sweep>()]
+                .copy_from_slice(bytemuck::bytes_of(&sweep));
+        }
+        self.gpu.queue.write_buffer(&b.sweeps, 0, &table);
     }
 }
 
@@ -1364,6 +1426,19 @@ mod tests {
         to.params.gravity = from.params.gravity;
     }
 
+    /// How far one step may land from another run of it on rounding alone, in
+    /// spacings. Chebyshev's extrapolation amplifies rounding: a slab flume step
+    /// at 0.9 lands 1.1e-4 of a spacing from the CPU's, against 4.6e-5 plain.
+    /// A fault in the acceleration itself -- its weights an iteration late, or
+    /// 0.8 run for 0.9 -- lands 2e-2 away, still far outside this.
+    fn rounding(config: &Config) -> f32 {
+        if config.solver.chebyshev > 0.0 {
+            3e-4
+        } else {
+            1e-4
+        }
+    }
+
     fn largest_gap(a: &[Vec3], b: &[Vec3]) -> f32 {
         a.iter()
             .zip(b)
@@ -1435,7 +1510,10 @@ mod tests {
             let vel = largest_gap(&cpu.vel, &twin.vel);
             let foam = largest_difference(&cpu.foam, &twin.foam);
             let spray = largest_difference(&cpu.spray, &twin.spray);
-            assert!(pos < 1e-4 * d, "{name}: positions differ by {pos}");
+            assert!(
+                pos < rounding(&config) * d,
+                "{name}: positions differ by {pos}"
+            );
             assert!(vel < 1e-2 * d, "{name}: velocities differ by {vel}");
             assert!(
                 foam < 1e-4 && spray < 1e-4,
@@ -1572,7 +1650,11 @@ mod tests {
     #[test]
     fn renumbering_keeps_every_particle_its_own() {
         let Some(gpu) = device() else { return };
-        let config = slab_flume();
+        // Plain Jacobi. Renumbering changes only the order sums round in, and
+        // Chebyshev amplifies rounding until a neighbour on the kernel's edge
+        // flips in or out, moving that particle's foam by more than rounding.
+        let mut config = slab_flume();
+        config.solver.chebyshev = 0.0;
         let mut cpu = fresh(&config);
         for _ in 0..60 {
             cpu.step(1.0 / 60.0);
@@ -1794,7 +1876,10 @@ mod tests {
                             label: None,
                             timestamp_writes: Some(timestamps(k)),
                         });
-                        solver.run(&mut pass, *which, n);
+                        match which {
+                            Pass::Delta => solver.run_delta(&mut pass, 0),
+                            _ => solver.run(&mut pass, *which, n),
+                        }
                     }
                     None => {
                         // The grid rebuild spans several passes; time it with an
@@ -1867,6 +1952,204 @@ mod tests {
                 );
                 start = std::time::Instant::now();
             }
+        }
+    }
+
+    /// The slab flume's accuracy against its solver iterations, with or without
+    /// Chebyshev acceleration: how far still water sinks in four seconds,
+    /// compression and bulk density mid-run, when and where the lip throws, how
+    /// far the surface half a second before that sits from the most-iterated
+    /// plain run's, and speed and compression through the splash to 20 s.
+    /// Ignored; `cargo test --release iteration_accuracy -- --ignored --nocapture`.
+    ///
+    /// `FLUIDS_VARIANTS=16,8:0.9,6:0.95:2` chooses the runs, each
+    /// `iterations[:chebyshev[:delay[:n]]]`, where `n` nudges the start by 1e-4
+    /// of a spacing: the surface gap between a run and its nudged twin is the
+    /// flow's own chaos, below which two runs cannot be told apart.
+    /// `FLUIDS_FULL=1` runs the whole `slab.toml` crest instead of the flume.
+    #[test]
+    #[ignore]
+    fn iteration_accuracy() {
+        struct Run {
+            iterations: u32,
+            chebyshev: f32,
+            delay: u32,
+            nudged: bool,
+            sink: f32,
+            mid: Readout,
+            lip: Option<(f32, f32)>,
+            surface: Vec<f32>,
+            splash: f32,
+            late: Vec<(f32, f32)>,
+            lost: usize,
+        }
+        let Some(gpu) = device() else { return };
+        let variants: Vec<(u32, f32, u32, bool)> = std::env::var("FLUIDS_VARIANTS")
+            .unwrap_or_else(|_| "8,16,32,32:0:1:n,8:0.9,6:0.95:2".into())
+            .split(',')
+            .map(|v| {
+                let fields: Vec<&str> = v.trim().split(':').collect();
+                (
+                    fields[0].parse().unwrap(),
+                    fields.get(1).map_or(0.0, |f| f.parse().unwrap()),
+                    fields.get(2).map_or(1, |f| f.parse().unwrap()),
+                    fields.get(3) == Some(&"n"),
+                )
+            })
+            .collect();
+        let base = match std::env::var("FLUIDS_FULL") {
+            Ok(_) => Config::load("slab.toml").unwrap(),
+            Err(_) => slab_flume(),
+        };
+        let dt = 1.0 / 60.0;
+        let (b, d) = (base.bounds(), base.fluid.spacing);
+        let reef = b.min.x + base.world.width * base.wave.reef_start;
+        let columns = (b.size().x / d).ceil() as usize;
+        // The highest particle over each column across the crest.
+        let surface = |fluid: &Fluid| {
+            let mut top = vec![b.min.y; columns];
+            for p in &fluid.pos {
+                let x = (((p.x - b.min.x) / d) as usize).min(columns - 1);
+                top[x] = top[x].max(p.y);
+            }
+            top
+        };
+        // Mean height of the offshore water, clear of the wall. A column
+        // compressed by a fraction sinks at its top by twice what its mean does.
+        let offshore = |fluid: &Fluid| {
+            let (sum, count) = fluid
+                .pos
+                .iter()
+                .filter(|p| p.x > b.min.x + 4.0 * d && p.x < reef - 4.0 * d)
+                .fold((0.0f64, 0u32), |(s, c), p| (s + p.y as f64, c + 1));
+            (sum / count as f64) as f32
+        };
+        let rms = |fluid: &Fluid| {
+            let sum: f64 = fluid.vel.iter().map(|v| v.length_squared() as f64).sum();
+            (sum / fluid.len() as f64).sqrt() as f32
+        };
+
+        let mut runs = Vec::new();
+        for (iterations, chebyshev, delay, nudged) in variants {
+            let mut config = base.clone();
+            config.solver.iterations = iterations;
+            config.solver.chebyshev = chebyshev;
+            config.solver.chebyshev_delay = delay;
+
+            let mut still_config = config.clone();
+            still_config.swell.height = 0.0;
+            let mut still = fresh(&still_config);
+            let rest = offshore(&still);
+            let mut solver = GpuFluid::new(gpu.clone(), &still);
+            for _ in 0..4 * 60 {
+                solver.step(&mut still, dt);
+            }
+            solver.download(&mut still);
+            let sink = 2.0 * (rest - offshore(&still)) / d;
+
+            let mut fluid = fresh(&config);
+            if nudged {
+                for (i, p) in fluid.pos.iter_mut().enumerate() {
+                    let s = ((i as f32 * 12.9898).sin() * 43758.547).fract() - 0.5;
+                    *p += Vec3::splat(s * 1e-4 * d);
+                }
+            }
+            let mut solver = GpuFluid::new(gpu.clone(), &fluid);
+            let (mut mid, mut lip, mut before) = (None, None, Vec::new());
+            let (mut splash, mut late) = (0.0f32, Vec::new());
+            for step in 1..=20 * 60 {
+                solver.step(&mut fluid, dt);
+                if step % 6 != 0 {
+                    continue;
+                }
+                let readout = solver.readout(&fluid).unwrap();
+                if step == 10 * 60 {
+                    mid = Some(readout);
+                }
+                solver.download(&mut fluid);
+                if step == 12 * 60 + 30 {
+                    before = surface(&fluid);
+                }
+                if step == 16 * 60 || step == 20 * 60 {
+                    late.push((rms(&fluid), readout.compression));
+                }
+                if lip.is_some() {
+                    splash = splash.max(readout.peak_speed);
+                } else if step > 12 * 60 + 30 {
+                    let thrown: Vec<_> = overturned_columns(&fluid, config.wave)
+                        .into_iter()
+                        .filter(|x| *x > reef)
+                        .collect();
+                    if thrown.len() >= 2 {
+                        lip = Some((fluid.elapsed, thrown[0]));
+                    }
+                }
+            }
+            runs.push(Run {
+                iterations,
+                chebyshev,
+                delay,
+                nudged,
+                sink,
+                mid: mid.unwrap(),
+                lip,
+                surface: before,
+                splash,
+                late,
+                lost: fluid.pos.iter().filter(|p| !p.is_finite()).count(),
+            });
+        }
+
+        let reference = runs
+            .iter()
+            .filter(|run| run.chebyshev == 0.0 && !run.nudged)
+            .max_by_key(|run| run.iterations)
+            .map(|run| run.surface.clone());
+        println!(
+            "{:>5} {:>5} {:>5} {:>9} {:>9} {:>6} {:>6} {:>6} {:>8} {:>7} {:>11} {:>11}",
+            "iter",
+            "cheb",
+            "delay",
+            "sink (d)",
+            "compress",
+            "bulk",
+            "lip t",
+            "lip x",
+            "gap (d)",
+            "splash",
+            "rms 16/20",
+            "comp 16/20"
+        );
+        for run in runs {
+            let gap = reference.as_ref().map_or(f32::NAN, |reference| {
+                let sq: f32 = reference
+                    .iter()
+                    .zip(&run.surface)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum();
+                (sq / columns as f32).sqrt() / d
+            });
+            let (lip_t, lip_x) = run.lip.unwrap_or((f32::NAN, f32::NAN));
+            println!(
+                "{:>5} {:>5.2} {:>5} {:>9.3} {:>9.4} {:>6.3} {lip_t:>6.1} {lip_x:>6.0} {gap:>8.3} {:>7.0} {:>5.1}/{:<5.1} {:.4}/{:.4}{}{}",
+                run.iterations,
+                run.chebyshev,
+                run.delay,
+                run.sink,
+                run.mid.compression,
+                run.mid.bulk,
+                run.splash,
+                run.late[0].0,
+                run.late[1].0,
+                run.late[0].1,
+                run.late[1].1,
+                if run.nudged { "  nudged" } else { "" },
+                if run.lost > 0 {
+                    format!("  {} lost", run.lost)
+                } else {
+                    String::new()
+                },
+            );
         }
     }
 }

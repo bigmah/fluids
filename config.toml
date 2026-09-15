@@ -143,6 +143,15 @@ iterations = 12
 # iterations shows a 3000 units/s transient.
 jacobi_relax = 0.5
 
+# Chebyshev acceleration of the iterations: an estimate of their spectral
+# radius, or 0 for plain Jacobi. Each iteration's result is pushed past itself,
+# away from where the particles were two iterations back, which carries
+# pressure down a deep column in fewer passes. slab.toml uses it; it has not
+# been measured on this tank, so it stays off here. Above 0.95 is refused.
+chebyshev = 0.0
+# Plain Jacobi iterations before the acceleration starts; at least 1.
+chebyshev_delay = 1
+
 # Constraint force mixing, as a fraction of the lattice gradient reference.
 # Softens the constraint so free-surface particles don't get huge multipliers.
 relaxation = 0.05
