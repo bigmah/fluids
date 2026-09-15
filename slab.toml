@@ -1,0 +1,90 @@
+# One big wave, plunging over a shallow reef. Run with
+# `cargo run --release -- slab.toml`. The lip throws about 13 simulated seconds
+# in, with a barrel by 14; S slows playback for it. This costs far more CPU
+# time than config.toml: about 100 ms per solver step on an M4 Pro, so it plays
+# well below real time. For a video, see the capture section of the README.
+#
+# config.toml sends an endless swell at an abrupt ledge, and at that tank's
+# proportions the swell collapses into a white bore instead of pitching: a
+# 914-unit wavelength in 480 units of water barely shoals before it reaches the
+# shelf. This preset sends one solitary wave instead -- a single crest with no
+# trough, the long-period limit of a swell -- up a long reef slope.
+#
+# Whether it plunges is set by the slope against the wave's height relative to
+# the water it starts in. Grilli et al. (1997) measured plunging breakers for
+# 0.025 < 1.521 * slope / sqrt(height / water_depth) < 0.3; spilling below,
+# a collapsing bore above. This slope is 1:8 and height / depth = 0.6, which
+# puts it at 0.25. A 1:5 slope (0.39) collapses without a lip.
+
+[scene]
+scenario = "wave"
+time_scale = 1.0
+replay_after = 0.0
+
+[swell]
+# 1 sends a single wave, which starts offshore already travelling; 0 is the
+# endless swell. A single wave has no period or generation zone, so
+# swell.period does nothing here.
+waves = 1
+# Crest height above still water. Past 0.7 of water_depth it breaks where it
+# starts. Its length follows from height and depth: it falls to 3% of its
+# height 745 units either side of the crest, and all of that has to fit in the
+# flat water before the reef.
+height = 120.0
+direction = 0.0
+
+[wave]
+water_depth = 200.0
+# 25 units of water over the shelf: about three particle layers.
+reef_height = 175.0
+# The reef starts 1602 units in, which leaves room for the whole wave.
+reef_start = 0.445
+# 1404 units of run for 175 of rise: the 1:8 slope.
+reef_width = 0.39
+# A little skew, so the lip lands progressively along the crest.
+reef_skew = 0.15
+# Starts 234 units past the top of the reef, beyond where the lip lands.
+beach_width = 0.10
+
+[world]
+# Same scale as config.toml: against real gravity this is 0.109 m per world
+# unit, a 13-metre wave in 22 metres of water breaking onto a 3-metre shelf.
+width = 3600.0
+height = 460.0
+depth = 200.0
+gravity = [0.0, -90.0, 0.0]
+
+[fluid]
+# Finer than config.toml: the lip is only a few particles thick at 14.
+# About 218,000 particles.
+spacing = 8.0
+smoothing_radius = 16.0
+
+[solver]
+substeps = 1
+iterations = 16
+jacobi_relax = 0.5
+relaxation = 0.05
+viscosity = 0.02
+tensile_k = 0.0
+tensile_q = 0.2
+tensile_n = 4
+clamp_constraint = true
+wall_friction = 1.0
+
+[render]
+surface_resolution = 1.1
+show_bounds = false
+particle_scale = 2.4
+# Foam calibration, as in config.toml. Higher than the swell tank's, so the
+# water stays green until the lip throws and the barrel's air shows through.
+foam_speed = 1400.0
+background = [0.67, 0.80, 0.87]
+deep_color = [0.015, 0.16, 0.20]
+mid_color = [0.08, 0.58, 0.53]
+foam_color = [0.92, 0.98, 1.00]
+vsync = true
+
+[input]
+mouse_radius = 110.0
+mouse_strength = 1300.0

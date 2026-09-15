@@ -44,12 +44,37 @@ struct Playback {
 
 /// Optional deterministic capture for visual regression checks. The window
 /// still renders normally; capture freezes at a requested simulation time.
+/// With `until` set, it saves a numbered frame every `every` simulated seconds
+/// from `at` to `until`, holding the simulation at each one, so the sequence
+/// plays back at the simulation's own speed whatever the machine's frame rate.
 #[derive(Resource)]
 struct Capture {
     at: f32,
+    start: f32,
+    until: Option<f32>,
+    every: f32,
+    frame: u32,
     path: String,
     warmup: u32,
     requested: bool,
+}
+
+impl Capture {
+    /// Within a quarter step counts as arrived. Landing exactly would take a
+    /// sliver of a step, and PBF reads velocity back out of the position change,
+    /// so a tiny `dt` turns ordinary density corrections into a velocity spike.
+    const SLACK: f32 = 0.25 / SIM_HZ as f32;
+
+    pub(crate) fn reached(&self, elapsed: f32) -> bool {
+        elapsed + Self::SLACK >= self.at
+    }
+
+    /// Sequence frames land on whole solver steps, so the recorded run takes
+    /// the same steps as an uncaptured one.
+    fn frame_time(&self) -> f32 {
+        let t = self.start + self.frame as f32 * self.every;
+        (t * SIM_HZ as f32).round() / SIM_HZ as f32
+    }
 }
 
 /// Exponentially smoothed frame and solver timings, for the title readout.
@@ -111,7 +136,14 @@ fn main() {
         config.solver.substeps,
         config.solver.iterations
     );
-    if config.scene.scenario == config::Scenario::Wave {
+    if config.scene.scenario == config::Scenario::Wave && config.swell.waves == 1 {
+        println!(
+            "Single wave: height {:.1} units in {:.1} of water; shelf depth {:.1} units",
+            config.swell.height,
+            config.wave.water_depth,
+            config.wave.water_depth - config.wave.reef_height,
+        );
+    } else if config.scene.scenario == config::Scenario::Wave {
         println!(
             "Swell: travel {:.1} degrees toward +X/+Z, height {:.1} units, period {:.2}s, wavelength {:.1} units; shelf depth {:.1} units",
             config.swell.direction,
@@ -124,18 +156,36 @@ fn main() {
         );
     }
 
-    let capture = std::env::var("FLUIDS_CAPTURE_PATH")
-        .ok()
-        .map(|path| Capture {
-            at: std::env::var("FLUIDS_CAPTURE_AT")
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|t| t.is_finite() && *t >= 0.0)
-                .unwrap_or(0.0),
+    let env_time = |name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|t| t.is_finite() && *t >= 0.0)
+    };
+    let capture = std::env::var("FLUIDS_CAPTURE_PATH").ok().map(|path| {
+        let start = env_time("FLUIDS_CAPTURE_AT").unwrap_or(0.0);
+        let mut capture = Capture {
+            at: start,
+            start,
+            until: env_time("FLUIDS_CAPTURE_UNTIL"),
+            every: 1.0
+                / env_time("FLUIDS_CAPTURE_FPS")
+                    .filter(|f| *f > 0.0)
+                    .unwrap_or(30.0),
+            frame: 0,
             path,
             warmup: 0,
             requested: false,
-        });
+        };
+        if capture.until.is_some() {
+            capture.at = capture.frame_time();
+            if let Err(e) = std::fs::create_dir_all(&capture.path) {
+                eprintln!("error: cannot create {}: {e}", capture.path);
+                std::process::exit(1);
+            }
+        }
+        capture
+    });
     let mut app = App::new();
     if let Some(capture) = capture {
         app.insert_resource(capture);
@@ -173,10 +223,12 @@ fn main() {
             handle_keys,
             handle_mouse.run_if(running),
             update_title,
-            capture_frame,
             playback_clock,
         ),
     )
+    // After the surface has been rebuilt for this frame, so a screenshot never
+    // sees an interpolated mesh left over from before the capture time advanced.
+    .add_systems(PostUpdate, capture_frame)
     .run();
 }
 
@@ -193,7 +245,10 @@ fn step_fluid(
 ) {
     let mut dt = time.delta_secs();
     if let Some(ref capture) = capture {
-        dt = dt.min((capture.at - fluid.elapsed).max(0.0));
+        if capture.reached(fluid.elapsed) {
+            return;
+        }
+        dt = dt.min(capture.at - fluid.elapsed);
     }
     if dt <= 0.0 {
         return;
@@ -356,27 +411,45 @@ fn capture_frame(
     let Some(mut capture) = capture else {
         return;
     };
-    if capture.requested || fluid.elapsed + 1e-5 < capture.at {
+    if capture.requested || !capture.reached(fluid.elapsed) {
         return;
     }
+    // The first frame waits for the renderer to warm up; later ones only need
+    // the frozen surface to reach the screen.
     capture.warmup += 1;
-    if capture.warmup < 30 {
+    if capture.warmup < if capture.frame == 0 { 30 } else { 2 } {
         return;
     }
-    capture.requested = true;
-    println!(
-        "Capture at {:.3}s: {:.2} ms solver, {:.2} ms surface",
-        fluid.elapsed, timings.solver_ms, surface.0
-    );
-    commands
-        .spawn(Screenshot::primary_window())
-        .observe(save_to_disk(capture.path.clone()))
-        .observe(
+    capture.warmup = 0;
+    let (path, last) = match capture.until {
+        None => (capture.path.clone(), true),
+        Some(until) => {
+            let path = std::path::Path::new(&capture.path)
+                .join(format!("frame-{:05}.png", capture.frame))
+                .to_string_lossy()
+                .into_owned();
+            capture.frame += 1;
+            capture.at = capture.frame_time();
+            (path, capture.at > until + Capture::SLACK)
+        }
+    };
+    if capture.frame <= 1 || last {
+        println!(
+            "Capture at {:.3}s: {:.2} ms solver, {:.2} ms surface",
+            fluid.elapsed, timings.solver_ms, surface.0
+        );
+    }
+    let mut screenshot = commands.spawn(Screenshot::primary_window());
+    screenshot.observe(save_to_disk(path));
+    if last {
+        capture.requested = true;
+        screenshot.observe(
             |_: On<bevy::render::view::screenshot::ScreenshotCaptured>,
              mut exit: MessageWriter<AppExit>| {
                 exit.write(AppExit::Success);
             },
         );
+    }
 }
 
 #[cfg(test)]

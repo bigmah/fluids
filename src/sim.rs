@@ -338,8 +338,10 @@ impl Fluid {
         self.vel.clear();
         let d = self.params.spacing;
         let b = self.params.bounds;
-        let maker = crate::wave::Wavemaker::new(wave, swell, b, self.params.gravity.length());
+        let gravity = self.params.gravity.length();
+        let maker = crate::wave::Wavemaker::new(wave, swell, b, gravity);
         self.wavemaker = Some(maker);
+        let single = crate::wave::Solitary::new(wave, swell, b, gravity);
         let counts = (b.size() / d).floor().as_uvec3();
         for z in 0..counts.z {
             for y in 0..counts.y {
@@ -349,9 +351,9 @@ impl Fluid {
                     if p.y < wave.floor(p, b) + d * 0.5 {
                         continue;
                     }
-                    if p.y <= wave.water_level(b) {
+                    if p.y <= wave.water_level(b) + single.map_or(0.0, |s| s.elevation(p.x)) {
                         self.pos.push(p);
-                        self.vel.push(Vec3::ZERO);
+                        self.vel.push(single.map_or(Vec3::ZERO, |s| s.velocity(p)));
                     }
                 }
             }

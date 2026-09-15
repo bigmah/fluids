@@ -66,6 +66,26 @@ wavelength and 3500 of depth to simulate. It is the same physics at a different
 scale — against real gravity the preset is 0.109 m per world unit, a 100-metre,
 8-second, 11-metre swell breaking over a 3-metre shelf.
 
+For one big wave that actually plunges, throwing a lip and a barrel onto a
+shallow reef:
+
+```
+cargo run --release -- slab.toml
+```
+
+The swell above collapses into a bore at its ledge rather than pitching: at that
+tank's proportions a deep-water wave barely shoals before it reaches the shelf,
+so it arrives already as steep as it can be and has nowhere to go. `slab.toml`
+sends a single solitary wave instead (`swell.waves = 1`) — one crest with no
+trough, the long-period limit of a swell — up a long 1:8 reef slope. It starts
+offshore already travelling, from the first-order Boussinesq solution, so there
+is no generation zone and no period. Whether it plunges follows Grilli et al.
+(1997): plunging for `0.025 < 1.521 · slope / sqrt(height / depth) < 0.3`, with
+spilling below and a collapsing bore above. The preset sits at 0.25; the same
+wave on a 1:5 slope (0.39) collapses without a lip. The lip throws about 13
+simulated seconds in. It is about 218,000 particles, so it runs well below real
+time.
+
 For the original short-period swell across a much wider crest:
 
 ```
@@ -100,6 +120,7 @@ Useful settings in `config.toml`:
 | `swell.direction` | Incoming travel angle relative to +X, in degrees |
 | `swell.height` | Target offshore crest-to-trough height |
 | `swell.period` | Time between crests; also sets wavelength and orbital speed |
+| `swell.waves` | `0` for the endless swell; `1` for a single solitary wave of `swell.height` above still water |
 | `wave.water_depth` | Still-water depth offshore |
 | `wave.reef_height` | Bed rise; water above the shelf is `water_depth - reef_height` |
 | `wave.reef_start` | Start of the bed rise, as a fraction of tank width |
@@ -348,6 +369,11 @@ can be wrong in ways that still compile and still produce plausible motion:
 - `slow_motion_preserves_the_physics` — identical particle states at the same
   simulated time at normal and quarter speed.
 - `coherent_translation_does_not_generate_foam` — speed alone does not whiten water.
+- `a_single_wave_plunges_over_the_reef` — `slab.toml` in a narrow flume starts
+  whole and offshore, then overturns with air under the lip over the reef,
+  before the beach.
+- `a_single_wave_is_validated_on_its_own_terms` — the swell's period and
+  wavelength limits do not apply to a single wave, but its own do.
 
 For repeatable GPU screenshots (the app renders, saves, and exits):
 
@@ -357,6 +383,19 @@ FLUIDS_CAPTURE_PATH=/tmp/reef-swell.png FLUIDS_CAPTURE_AT=12 cargo run --release
 
 `FLUIDS_CAPTURE_AT` is simulation time in seconds, not wall-clock time. Captures
 disable automatic replay and allow the renderer to warm up at the requested time.
+
+Set `FLUIDS_CAPTURE_UNTIL` as well and the path is a directory that receives a
+numbered frame every `1 / FLUIDS_CAPTURE_FPS` simulated seconds (default 30),
+from `FLUIDS_CAPTURE_AT` to `FLUIDS_CAPTURE_UNTIL`. The simulation holds at each
+frame and the frames land on whole solver steps, so the sequence plays at the
+simulation's own speed however slowly the machine renders it. The break in
+`slab.toml`, at quarter speed:
+
+```
+FLUIDS_CAPTURE_PATH=/tmp/slab FLUIDS_CAPTURE_AT=12 FLUIDS_CAPTURE_UNTIL=14.5 \
+  FLUIDS_CAPTURE_FPS=60 cargo run --release -- slab.toml
+ffmpeg -framerate 15 -i /tmp/slab/frame-%05d.png -vf scale=1280:-2,format=yuv420p slab.mp4
+```
 
 The config has its own set, which mostly exist to keep it from failing quietly:
 a typo'd field is rejected rather than ignored, a named config file that does

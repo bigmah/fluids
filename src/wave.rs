@@ -1,5 +1,6 @@
 //! A directional swell generation zone and a steep reef in a particle wave tank.
 //! Only the offshore zone is driven; shoaling and breaking are solved by PBF.
+//! A single solitary wave can replace the swell; it is set moving at reset.
 
 use crate::sim::Bounds;
 use bevy::math::Vec3;
@@ -15,6 +16,8 @@ pub struct Swell {
     pub height: f32,
     /// Period in simulation seconds, independent of playback speed.
     pub period: f32,
+    /// 0 for an endless swell, or 1 for a single solitary wave of `height`.
+    pub waves: u32,
 }
 
 impl Default for Swell {
@@ -23,6 +26,7 @@ impl Default for Swell {
             direction: 0.0,
             height: 40.0,
             period: 1.8,
+            waves: 0,
         }
     }
 }
@@ -112,6 +116,9 @@ impl Wave {
                 "swell.height must be finite and nonnegative (crest-to-trough world units)".into(),
             );
         }
+        if swell.waves > 1 {
+            return Err("swell.waves must be 0 (an endless swell) or 1 (a single wave)".into());
+        }
         if swell.height > 0.0 && swell.height < 3.0 * spacing {
             return Err("swell.height must resolve at least three particle spacings; lower fluid.spacing and smoothing_radius together (or set height = 0 for still water)".into());
         }
@@ -123,24 +130,45 @@ impl Wave {
         if self.water_depth + 2.0 * swell.height + spacing > bounds.size().y {
             return Err("world.height must fit wave.water_depth + 2 * swell.height + fluid.spacing to leave room for breaking crests".into());
         }
-        let wavelength = swell.wavelength(-gravity.y, self.water_depth);
-        if !wavelength.is_finite() || wavelength < 12.0 * spacing {
-            return Err("swell.period is too short to resolve its wavelength; increase it or lower fluid.spacing".into());
-        }
-        if self.water_depth < wavelength * 0.5 {
-            return Err(format!(
-                "deep-water swell needs wave.water_depth >= half its wavelength ({:.1}); increase depth or shorten swell.period",
-                wavelength * 0.5
-            ));
-        }
-        if swell.height / wavelength > 0.12 {
-            return Err("swell.height / wavelength must be <= 0.12 so the incoming swell does not already break offshore; lower height or increase period and depth".into());
-        }
         let skew = self.reef_skew.abs() * bounds.size().z * 0.5;
         let offshore = self.reef_start * bounds.size().x - skew;
-        let maker = Wavemaker::new(*self, swell, bounds, -gravity.y);
-        if offshore < maker.generation_width + 4.0 * spacing {
-            return Err("wave.reef_start must leave at least four particle spacings of deep water beyond the generation zone; increase world.width or reef_start, or shorten swell.period".into());
+        if let Some(single) = Solitary::new(*self, swell, bounds, -gravity.y) {
+            // No period and no generation zone: the wave starts whole, in flat
+            // water, and only has to fit there and hold together.
+            if swell.direction != 0.0 {
+                return Err("a single wave travels straight at the reef: set swell.direction = 0 and angle the break with wave.reef_skew".into());
+            }
+            if swell.height > 0.7 * self.water_depth {
+                return Err(format!(
+                    "a single wave taller than 0.7 of wave.water_depth ({:.1}) breaks where it starts; lower swell.height or deepen the water",
+                    0.7 * self.water_depth
+                ));
+            }
+            let room = 2.0 * single.half_width() + 4.0 * spacing;
+            if offshore < room {
+                return Err(format!(
+                    "wave.reef_start must leave {:.0} units of flat water for the single wave to start in; increase world.width or reef_start, or lower swell.height",
+                    room + skew
+                ));
+            }
+        } else {
+            let wavelength = swell.wavelength(-gravity.y, self.water_depth);
+            if !wavelength.is_finite() || wavelength < 12.0 * spacing {
+                return Err("swell.period is too short to resolve its wavelength; increase it or lower fluid.spacing".into());
+            }
+            if self.water_depth < wavelength * 0.5 {
+                return Err(format!(
+                    "deep-water swell needs wave.water_depth >= half its wavelength ({:.1}); increase depth or shorten swell.period",
+                    wavelength * 0.5
+                ));
+            }
+            if swell.height / wavelength > 0.12 {
+                return Err("swell.height / wavelength must be <= 0.12 so the incoming swell does not already break offshore; lower height or increase period and depth".into());
+            }
+            let maker = Wavemaker::new(*self, swell, bounds, -gravity.y);
+            if offshore < maker.generation_width + 4.0 * spacing {
+                return Err("wave.reef_start must leave at least four particle spacings of deep water beyond the generation zone; increase world.width or reef_start, or shorten swell.period".into());
+            }
         }
         if self.reef_width * bounds.size().x < 2.0 * spacing {
             return Err("wave.reef_width must resolve at least two particle spacings".into());
@@ -201,6 +229,70 @@ impl Wave {
     }
 }
 
+/// One solitary wave: a single crest with no trough, the long-period limit of
+/// a swell. Unlike the swell it is not generated; reset places it offshore
+/// already travelling, from the first-order Boussinesq solution for height H in
+/// depth h:  eta = H sech^2(K (x - x0)),  K = sqrt(3H / 4h^3),  c = sqrt(g (h + H)).
+///
+/// Whether it plunges is set by the reef slope s against its relative height:
+/// Grilli et al. (1997) put plunging at 0.025 < 1.521 s / sqrt(H/h) < 0.3, with
+/// spilling below and a collapsing bore above. A steep ledge surges.
+#[derive(Debug, Clone, Copy)]
+pub struct Solitary {
+    height: f32,
+    depth: f32,
+    k: f32,
+    celerity: f32,
+    crest_x: f32,
+    bed_y: f32,
+}
+
+impl Solitary {
+    /// Distance from the crest, in units of 1/K, at which the wave has fallen
+    /// to under 3% of its height. The crest starts this far from the wall.
+    const REACH: f32 = 2.5;
+
+    pub fn new(wave: Wave, swell: Swell, bounds: Bounds, gravity: f32) -> Option<Self> {
+        (swell.waves == 1 && swell.height > 0.0).then(|| {
+            let (height, depth) = (swell.height, wave.water_depth);
+            let k = (3.0 * height / (4.0 * depth.powi(3))).sqrt();
+            Self {
+                height,
+                depth,
+                k,
+                celerity: (gravity * (depth + height)).sqrt(),
+                crest_x: bounds.min.x + Self::REACH / k,
+                bed_y: bounds.min.y,
+            }
+        })
+    }
+
+    /// Distance from the crest to where the wave has all but vanished.
+    pub fn half_width(&self) -> f32 {
+        Self::REACH / self.k
+    }
+
+    pub fn elevation(&self, x: f32) -> f32 {
+        self.height / (self.k * (x - self.crest_x)).cosh().powi(2)
+    }
+
+    pub fn velocity(&self, p: Vec3) -> Vec3 {
+        let theta = self.k * (p.x - self.crest_x);
+        let sech2 = 1.0 / theta.cosh().powi(2);
+        let eta = self.height * sech2;
+        // Depth-averaged flux carries the crest's volume at the celerity; the
+        // vertical part follows from continuity, rising ahead of the crest.
+        let along = self.celerity * eta / (self.depth + eta);
+        let up = 3f32.sqrt()
+            * self.celerity
+            * (self.height / self.depth).powf(1.5)
+            * ((p.y - self.bed_y) / self.depth)
+            * sech2
+            * theta.tanh();
+        Vec3::new(along, up, 0.0)
+    }
+}
+
 /// A first-order wave relaxation zone, derived once at reset. Its target is
 /// the finite-depth Airy orbital velocity field. Forcing fades out in deep
 /// water, leaving the approach, reef and shelf entirely to the particle solver.
@@ -211,6 +303,8 @@ pub struct Wavemaker {
     amplitude: f32,
     omega: f32,
     k: f32,
+    /// A single wave replaces the swell, so nothing is generated.
+    single: Option<Solitary>,
     direction: Vec3,
     depth: f32,
     level: f32,
@@ -224,16 +318,20 @@ impl Wavemaker {
     pub fn new(wave: Wave, swell: Swell, bounds: Bounds, gravity: f32) -> Self {
         let k = swell.wavenumber(gravity, wave.water_depth);
         let (sin, cos) = swell.direction.to_radians().sin_cos();
+        let single = Solitary::new(wave, swell, bounds, gravity);
         Self {
             origin_x: bounds.min.x,
             amplitude: swell.height * 0.5,
             omega: TAU / swell.period,
             k,
+            single,
             direction: Vec3::new(cos, 0.0, sin),
             depth: wave.water_depth,
             level: wave.water_level(bounds),
             generation_width: 0.7 * TAU / k,
-            period: swell.period,
+            // The beach absorbs over a period. A single wave has none, so use the
+            // time its own width takes to pass.
+            period: single.map_or(swell.period, |s| 2.0 * s.half_width() / s.celerity),
             beach_start: bounds.max.x - wave.beach_width * bounds.size().x,
             beach_width: wave.beach_width * bounds.size().x,
         }
@@ -258,18 +356,28 @@ impl Wavemaker {
     }
 
     pub fn generation_weight(&self, p: Vec3) -> f32 {
+        if self.single.is_some() {
+            return 0.0;
+        }
         let q = ((p.x - self.origin_x) / self.generation_width).clamp(0.0, 1.0);
         // Smooth on both ends, with a long taper into unforced deep water.
         (PI * q).sin().powi(2)
     }
 
     pub fn drive(&self, p: Vec3, velocity: Vec3, time: f32, dt: f32) -> Vec3 {
-        let blend = 1.0 - (-12.0 * self.generation_weight(p) * dt / self.period).exp();
+        let weight = self.generation_weight(p);
+        if weight == 0.0 {
+            return velocity;
+        }
+        let blend = 1.0 - (-12.0 * weight * dt / self.period).exp();
         velocity.lerp(self.orbital_velocity(p, time), blend)
     }
 
     pub fn peak_speed(&self) -> f32 {
-        self.amplitude * self.omega / (self.k * self.depth).tanh()
+        match self.single {
+            Some(s) => s.celerity,
+            None => self.amplitude * self.omega / (self.k * self.depth).tanh(),
+        }
     }
 
     pub fn damping(&self, p: Vec3, dt: f32) -> f32 {
@@ -517,5 +625,122 @@ mod tests {
             (gauge(&f, offshore_x) - c.wave.water_level(c.bounds())).abs() < 1.5 * c.fluid.spacing,
             "solid boundary support must preserve offshore water depth"
         );
+    }
+
+    /// Columns of an x-y slice, summed over z, where air lies under an
+    /// overturned lip: at least two cells of water on top, then at least two
+    /// cells of air before more water or the bed. Returns each column's centre.
+    /// A cell counts as water with three tenths of a full row of particles, so
+    /// spray does not register as a lip.
+    fn overturned_columns(fluid: &Fluid, wave: Wave) -> Vec<f32> {
+        let (b, d) = (fluid.params.bounds, fluid.params.spacing);
+        let nx = (b.size().x / d).ceil() as usize;
+        let ny = (b.size().y / d).ceil() as usize;
+        let mut counts = vec![0u32; nx * ny];
+        for p in &fluid.pos {
+            let x = (((p.x - b.min.x) / d) as usize).min(nx - 1);
+            let y = (((p.y - b.min.y) / d) as usize).min(ny - 1);
+            counts[x + y * nx] += 1;
+        }
+        let full = (b.size().z / d).floor() as u32;
+        let water = |x: usize, y: usize| counts[x + y * nx] * 10 >= full * 3;
+        (0..nx)
+            .filter_map(|x| {
+                let centre = b.min.x + (x as f32 + 0.5) * d;
+                let bed = ((wave.floor(Vec3::new(centre, 0.0, 0.0), b) - b.min.y) / d) as usize;
+                let mut y = (bed..ny).rev().find(|&y| water(x, y))?;
+                let top = y;
+                while y > bed && water(x, y) {
+                    y -= 1;
+                }
+                let underside = y;
+                while y > bed && !water(x, y) {
+                    y -= 1;
+                }
+                (top - underside >= 2 && underside - y >= 2).then_some(centre)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_single_wave_plunges_over_the_reef() {
+        let mut c = Config::load("slab.toml").unwrap();
+        // A narrow flume at the preset's resolution, as in the swell test.
+        c.world.depth = 8.0 * c.fluid.spacing;
+        c.wave.reef_skew = 0.0;
+        c.validate().unwrap();
+        let (b, d) = (c.bounds(), c.fluid.spacing);
+        let level = c.wave.water_level(b);
+        let reef = b.min.x + c.world.width * c.wave.reef_start;
+        let beach = b.max.x - c.world.width * c.wave.beach_width;
+        let mut f = Fluid::new(c.fluid_params());
+        c.reset_fluid(&mut f);
+
+        // It starts whole: offshore, at full height, and already moving in.
+        let crest = f
+            .pos
+            .iter()
+            .copied()
+            .max_by(|a, b| a.y.total_cmp(&b.y))
+            .unwrap();
+        assert!(crest.y > level + c.swell.height - d, "crest at {crest}");
+        assert!(f.pos.iter().all(|p| p.x < reef || p.y < level + d));
+        assert!(
+            f.vel
+                .iter()
+                .all(|v| v.is_finite() && v.x >= 0.0 && v.x < c.expected_peak_speed())
+        );
+
+        let mut peak = 0.0f32;
+        for step in 1..=20 * 60 {
+            f.step(1.0 / 60.0);
+            peak = peak.max(f.max_speed());
+            if step % 6 != 0 {
+                continue;
+            }
+            // Only over the reef: the lattice settling offshore at the start
+            // briefly leaves rows of empty cells that would read as air.
+            let lip: Vec<_> = overturned_columns(&f, c.wave)
+                .into_iter()
+                .filter(|x| *x > reef)
+                .collect();
+            if lip.len() >= 2 {
+                assert!(
+                    lip.iter().all(|x| *x < beach),
+                    "overturned on the beach: {lip:?}"
+                );
+                assert!(peak < c.expected_peak_speed(), "peak speed {peak}");
+                assert_eq!(f.len(), f.pos.iter().filter(|p| p.is_finite()).count());
+                return;
+            }
+        }
+        panic!("the single wave never overturned over the reef");
+    }
+
+    #[test]
+    fn a_single_wave_is_validated_on_its_own_terms() {
+        let c = Config::load("slab.toml").unwrap();
+        // No period and no generation zone, so the swell's limits do not apply.
+        let mut long = c.clone();
+        long.swell.period = 30.0;
+        long.validate().unwrap();
+        let mut too_many = c.clone();
+        too_many.swell.waves = 2;
+        assert!(too_many.validate().unwrap_err().contains("swell.waves"));
+        let mut angled = c.clone();
+        angled.swell.direction = 20.0;
+        assert!(angled.validate().unwrap_err().contains("straight"));
+        let mut tall = c.clone();
+        tall.swell.height = 0.75 * c.wave.water_depth;
+        tall.world.height = 2.0 * c.world.height;
+        assert!(tall.validate().unwrap_err().contains("0.7"));
+        let mut cramped = c.clone();
+        cramped.wave.reef_start = 0.3;
+        assert!(cramped.validate().unwrap_err().contains("flat water"));
+        // The same file with the swell back on is held to the swell's limits.
+        let mut swell = c;
+        swell.swell.waves = 0;
+        swell.swell.period = 30.0;
+        assert!(swell.validate().is_err());
     }
 }

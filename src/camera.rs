@@ -62,8 +62,14 @@ fn spawn_camera(mut commands: Commands, config: Res<Config>) {
         // A wave is only ever about a tenth of its own wavelength tall, so a
         // shot framing the whole tank makes any swell look small no matter how
         // big it is. This one sits close enough to the reef that the offshore
-        // half runs off the sides. Scroll still zooms.
-        radius: size.length() * if wave { 0.38 } else { 1.05 },
+        // half runs off the sides, and frames at most four tank-heights of a
+        // long tank, so a long approach does not push the break into the
+        // distance. Scroll still zooms.
+        radius: if wave {
+            Vec3::new(size.x.min(4.0 * size.y), size.y, size.z).length() * 0.38
+        } else {
+            size.length() * 1.05
+        },
         yaw: if wave { 0.58 } else { 0.7 },
         pitch: 0.30,
     };

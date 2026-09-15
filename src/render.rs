@@ -209,10 +209,7 @@ fn sync_surface(
     paused: Res<crate::Paused>,
     capture: Option<Res<crate::Capture>>,
 ) {
-    let frozen = paused.0
-        || capture
-            .as_ref()
-            .is_some_and(|c| fluid.elapsed + 1e-5 >= c.at);
+    let frozen = paused.0 || capture.as_ref().is_some_and(|c| c.reached(fluid.elapsed));
     if !fluid.is_changed() && frozen {
         return;
     }
@@ -276,10 +273,7 @@ fn sync_particles(
     capture: Option<Res<crate::Capture>>,
     mut particles: Query<(&ParticleIndex, &mut Transform, &mut Visibility)>,
 ) {
-    let frozen = paused.0
-        || capture
-            .as_ref()
-            .is_some_and(|c| fluid.elapsed + 1e-5 >= c.at);
+    let frozen = paused.0 || capture.as_ref().is_some_and(|c| c.reached(fluid.elapsed));
     if !fluid.is_changed() && !mode.is_changed() && frozen {
         return;
     }
