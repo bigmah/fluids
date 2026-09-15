@@ -1853,9 +1853,11 @@ name = "fluids"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytemuck",
  "rayon",
  "serde",
  "toml",
+ "wgpu",
 ]
 
 [[package]]

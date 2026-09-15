@@ -1,8 +1,9 @@
 # One big wave, plunging along a wide crest over a shallow reef. Run with
 # `cargo run --release -- slab.toml`. The lip throws about 13 simulated seconds
 # in, with a barrel the whole way across by 14; S slows playback for it. This
-# costs far more CPU time than config.toml: about half a second per solver step
-# on an M4 Pro, so the break takes several minutes to arrive. For a video, see
+# costs far more than config.toml: about 80 ms per solver step on an M4 Pro's
+# GPU, 400 on its CPU, so the break takes about a minute to arrive on the GPU
+# and ten on the CPU. For a video, see
 # the capture section of the README. For quick experiments, world.depth = 200
 # is the same break across a narrow strip, at a sixth of the cost.
 #
@@ -68,6 +69,7 @@ spacing = 8.0
 smoothing_radius = 16.0
 
 [solver]
+backend = "gpu"
 substeps = 1
 iterations = 16
 jacobi_relax = 0.5

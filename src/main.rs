@@ -17,19 +17,26 @@
 
 mod camera;
 mod config;
+mod gpu;
 mod render;
 mod sim;
+mod sim_gpu;
+mod spray_gpu;
 mod surface;
+mod surface_gpu;
 mod wave;
 
 use bevy::prelude::*;
+use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PresentMode, PrimaryWindow};
 
 use camera::{OrbitCamera, OrbitCameraPlugin};
 use config::Config;
+use gpu::Gpu;
 use render::FluidRenderPlugin;
 use sim::Fluid;
+use sim_gpu::GpuFluid;
 
 /// Solver rate. The solver is stable here; see the tests in `sim`.
 const SIM_HZ: f64 = 60.0;
@@ -128,13 +135,17 @@ fn main() {
     config.reset_fluid(&mut fluid);
     let size = config.bounds().size();
     println!(
-        "{} particles, {}x{}x{} world, {} substeps x {} iterations",
+        "{} particles, {}x{}x{} world, {} substeps x {} iterations on the {}",
         fluid.len(),
         size.x,
         size.y,
         size.z,
         config.solver.substeps,
-        config.solver.iterations
+        config.solver.iterations,
+        match config.solver.backend {
+            config::Backend::Gpu => "GPU",
+            config::Backend::Cpu => "CPU",
+        }
     );
     if config.scene.scenario == config::Scenario::Wave && config.swell.waves == 1 {
         println!(
@@ -216,11 +227,13 @@ fn main() {
     .init_resource::<HudTimer>()
     .init_resource::<Timings>()
     .add_plugins((OrbitCameraPlugin, FluidRenderPlugin))
+    .add_systems(Startup, start_gpu_solver)
     .add_systems(FixedUpdate, step_fluid.run_if(running))
     .add_systems(
         Update,
         (
             handle_keys,
+            sync_gpu_fluid.after(handle_keys),
             handle_mouse.run_if(running),
             update_title,
             playback_clock,
@@ -236,8 +249,37 @@ fn running(paused: Res<Paused>) -> bool {
     !paused.0
 }
 
+/// Moves the solver onto the renderer's own GPU when the config asks for it.
+/// The render device exists by the time `Startup` runs; without one, the CPU
+/// solver carries on.
+fn start_gpu_solver(
+    mut commands: Commands,
+    config: Res<Config>,
+    fluid: Res<Fluid>,
+    device: Option<Res<RenderDevice>>,
+    queue: Option<Res<RenderQueue>>,
+) {
+    if config.solver.backend != config::Backend::Gpu {
+        return;
+    }
+    let (Some(device), Some(queue)) = (device, queue) else {
+        warn!("no render device; the solver stays on the CPU");
+        return;
+    };
+    let gpu = Gpu::new(device.clone(), queue.clone());
+    commands.insert_resource(GpuFluid::new(gpu, &fluid));
+}
+
+/// A reset while paused has no step to carry it to the GPU; this does.
+fn sync_gpu_fluid(fluid: Res<Fluid>, gpu: Option<ResMut<GpuFluid>>) {
+    if let Some(mut gpu) = gpu {
+        gpu.sync(&fluid);
+    }
+}
+
 fn step_fluid(
     mut fluid: ResMut<Fluid>,
+    gpu: Option<ResMut<GpuFluid>>,
     time: Res<Time<Fixed>>,
     mut timings: ResMut<Timings>,
     config: Res<Config>,
@@ -254,7 +296,11 @@ fn step_fluid(
         return;
     }
     let start = std::time::Instant::now();
-    fluid.step(dt);
+    // A reset below is picked up by the GPU solver at its next step.
+    match gpu {
+        Some(mut gpu) => gpu.step(&mut fluid, dt),
+        None => fluid.step(dt),
+    }
     if capture.is_none()
         && config.scene.replay_after > 0.0
         && fluid.elapsed >= config.scene.replay_after
@@ -304,6 +350,10 @@ fn handle_keys(
 /// under the cursor. Falling back to a plane through the camera's focus point
 /// keeps a drag going when the cursor slides off the water mid-stroke, instead
 /// of the push cutting out.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Bevy injects resources as independent system parameters"
+)]
 fn handle_mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -312,6 +362,7 @@ fn handle_mouse(
     config: Res<Config>,
     time: Res<Time>,
     mut fluid: ResMut<Fluid>,
+    gpu: Option<ResMut<GpuFluid>>,
 ) {
     if !buttons.pressed(MouseButton::Left) {
         return;
@@ -325,7 +376,12 @@ fn handle_mouse(
     };
 
     let reach = config.input.mouse_radius;
-    let point = match fluid.nearest_along_ray(ray.origin, *ray.direction, reach) {
+    // With the GPU solving, only the GPU knows where the particles are.
+    let hit = match gpu.as_ref() {
+        Some(gpu) => gpu.nearest_along_ray(&fluid, ray.origin, *ray.direction, reach),
+        None => fluid.nearest_along_ray(ray.origin, *ray.direction, reach),
+    };
+    let point = match hit {
         Some(hit) => hit,
         None => {
             let plane = InfinitePlane3d::new(camera_transform.forward());
@@ -339,7 +395,10 @@ fn handle_mouse(
     let pull = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     // Scaled by frame time so the push feels the same regardless of frame rate.
     let strength = config.input.mouse_strength * time.delta_secs() * if pull { -1.0 } else { 1.0 };
-    fluid.apply_radial_impulse(point, config.input.mouse_radius, strength);
+    match gpu {
+        Some(mut gpu) => gpu.apply_radial_impulse(point, config.input.mouse_radius, strength),
+        None => fluid.apply_radial_impulse(point, config.input.mouse_radius, strength),
+    }
 }
 
 /// Reports the live state of the solver in the window title: how far the fluid
@@ -358,22 +417,31 @@ fn update_title(
     mut window: Single<&mut Window, With<PrimaryWindow>>,
     surface: Res<render::SurfaceTiming>,
     playback: Res<Playback>,
+    gpu: Option<Res<GpuFluid>>,
 ) {
     Timings::feed(&mut timings.frame_ms, real.delta_secs() * 1000.0);
     if !timer.0.tick(time.delta()).just_finished() {
         return;
     }
+    // Measured where the neighbour lists live: on the GPU when it is solving.
+    let (compression, bulk, peak) = match gpu.as_ref().and_then(|gpu| gpu.readout(&fluid)) {
+        Some(readout) => (readout.compression, readout.bulk, readout.peak_speed),
+        None => (
+            fluid.compression_error(),
+            fluid.interior_density_ratio(),
+            fluid.max_speed(),
+        ),
+    };
     // Counted geometrically rather than read off the SPH estimate, which is
     // truncated near every surface. 100% is a fluid at rest density; a pool too
     // thin to have a bulk has nothing to report.
-    let bulk = fluid.interior_density_ratio();
     let bulk = if bulk.is_finite() {
         format!("{:.0}%", bulk * 100.0)
     } else {
         "n/a".to_string()
     };
     window.title = format!(
-        "{} | {:.2}s / {:.2}x | {} particles | {:.1} ms ({:.1} solve + {:.1} surface) | compression {:.1}% | bulk {bulk} | peak {:.0}{} | SPACE pause · R replay · S speed · P particles · B bounds",
+        "{} | {:.2}s / {:.2}x | {} particles | {:.1} ms ({:.1} {} solve + {:.1} surface) | compression {:.1}% | bulk {bulk} | peak {:.0}{} | SPACE pause · R replay · S speed · P particles · B bounds",
         if fluid.wave.is_some() {
             "Swell / reef break"
         } else {
@@ -384,9 +452,10 @@ fn update_title(
         fluid.len(),
         timings.frame_ms,
         timings.solver_ms,
+        if gpu.is_some() { "GPU" } else { "CPU" },
         surface.0,
-        fluid.compression_error() * 100.0,
-        fluid.max_speed(),
+        compression * 100.0,
+        peak,
         if paused.0 { " - PAUSED" } else { "" },
     );
 }

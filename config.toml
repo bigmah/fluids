@@ -119,6 +119,12 @@ spacing = 14.0
 smoothing_radius = 28.0
 
 [solver]
+# "gpu" runs the solver, the surface and the spray as compute shaders on the
+# renderer's device, and nothing about the particles comes back to the CPU.
+# "cpu" runs the reference solver in sim.rs on every core, and rebuilds and
+# uploads the surface each frame. Both compute the same substep.
+backend = "gpu"
+
 # Solver steps per frame. The one to raise when you lower `spacing` or deepen
 # the block: peak speed comes from gravity and drop height, not from
 # resolution, so a smaller kernel means a particle covers more of it per step.
@@ -162,7 +168,7 @@ wall_friction = 1.0
 
 [render]
 # Mesh cell size as a multiple of spacing, so it follows the resolution above.
-# Smaller cells resolve the lip more finely but cost more CPU time.
+# Smaller cells resolve the lip more finely but cost more to rebuild.
 # P toggles the particle diagnostic; B toggles tank bounds.
 surface_resolution = 1.1
 show_bounds = false

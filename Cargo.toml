@@ -5,9 +5,13 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["bevy_winit", "bevy_sprite", "bevy_core_pipeline", "bevy_asset", "bevy_log", "bevy_window", "multi_threaded", "std", "bevy_sprite_render", "png", "bevy_pbr", "tonemapping_luts", "ktx2", "zstd_rust"] }
+bytemuck = { version = "1", features = ["derive"] }
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+# The same wgpu Bevy renders with, named directly so tests can open a headless
+# device. The app hands the GPU solver Bevy's own device instead.
+wgpu = { version = "29", default-features = false }
 
 # Optimise the solver as well as Bevy so a plain `cargo run` also has interactive
 # performance. The dev profile still retains debug information and assertions.

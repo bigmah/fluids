@@ -1,6 +1,19 @@
 //! Continuous, volumetrically shaded water with a particle diagnostic view.
+//!
+//! With the CPU solver, the surface is rebuilt on the CPU and uploaded as a
+//! mesh and a density texture every frame, and spray is an entity per particle.
+//! With the GPU solver, the surface, its texture and the spray are written in
+//! place on the GPU during extraction (see [`rebuild_on_gpu`]); their meshes
+//! only cross to the GPU empty, when they are made or outgrown.
 
-use crate::{config::Config, sim::Fluid, surface::Surface};
+use crate::{
+    config::Config,
+    sim::Fluid,
+    sim_gpu::GpuFluid,
+    spray_gpu::{DROPLET_VERTICES, GpuSpray, SprayStyle},
+    surface::{Surface, SurfaceLayout},
+    surface_gpu::{DENSITY_FORMAT, GpuSurface, SurfaceTarget},
+};
 use bevy::{
     asset::{RenderAssetUsages, embedded_asset},
     camera::visibility::NoFrustumCulling,
@@ -8,8 +21,20 @@ use bevy::{
     mesh::PrimitiveTopology,
     prelude::*,
     reflect::TypePath,
-    render::render_resource::{AsBindGroup, Extent3d, TextureDimension, TextureFormat},
+    render::{
+        Extract, ExtractSchedule, RenderApp,
+        mesh::allocator::{MeshAllocator, MeshAllocatorSettings},
+        render_asset::RenderAssets,
+        render_resource::{
+            AsBindGroup, BufferUsages, Extent3d, TextureDimension, TextureFormat, TextureUsages,
+        },
+        texture::GpuImage,
+    },
     shader::ShaderRef,
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
 };
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
@@ -61,12 +86,50 @@ struct DiagnosticView(bool);
 #[derive(Resource, Default)]
 pub struct SurfaceTiming(pub f32);
 
+/// What the last GPU surface rebuild needed and cost, shared between the
+/// render world that rebuilds it and the main world that sizes the mesh.
+#[derive(Resource, Clone, Default)]
+struct SurfaceStatus(Arc<SurfaceCounters>);
+
+#[derive(Default)]
+struct SurfaceCounters {
+    /// Triangles the surface needed, which can exceed what the mesh holds.
+    triangles: AtomicU32,
+    /// Droplets the spray needed, likewise.
+    droplets: AtomicU32,
+    milliseconds: AtomicU32,
+    /// Bumped per rebuild, so the main world only reads fresh figures.
+    rebuilds: AtomicU32,
+}
+
+/// Triangles the GPU-written water mesh has room for.
+#[derive(Resource)]
+struct WaterCapacity(u32);
+
+/// The GPU-written spray mesh, and the droplets it has room for.
+#[derive(Resource)]
+struct SprayMesh {
+    mesh: Handle<Mesh>,
+    droplets: u32,
+}
+
+/// The most droplets the spray mesh grows to, about 75 MB of vertices. Beyond
+/// it the particle diagnostic shows every few particles rather than all.
+const MAX_DROPLETS: u32 = 1 << 17;
+
 pub struct FluidRenderPlugin;
 impl Plugin for FluidRenderPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "water.wgsl");
         let bg = app.world().resource::<Config>().render.background;
-        app.add_plugins(MaterialPlugin::<WaterMaterial>::default())
+        let status = SurfaceStatus::default();
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app
+                .insert_resource(status.clone())
+                .add_systems(ExtractSchedule, rebuild_on_gpu);
+        }
+        app.insert_resource(status)
+            .add_plugins(MaterialPlugin::<WaterMaterial>::default())
             .insert_resource(ClearColor(Color::srgb(bg[0], bg[1], bg[2])))
             .insert_resource(GlobalAmbientLight {
                 color: Color::srgb(0.72, 0.85, 1.0),
@@ -75,16 +138,37 @@ impl Plugin for FluidRenderPlugin {
             })
             .init_resource::<DiagnosticView>()
             .init_resource::<SurfaceTiming>()
-            .add_systems(Startup, spawn_scene)
+            .add_systems(Startup, spawn_scene.after(crate::start_gpu_solver))
             .add_systems(
                 Update,
-                (toggle_diagnostics, sync_surface, sync_particles)
+                (
+                    toggle_diagnostics,
+                    sync_surface,
+                    sync_particles,
+                    grow_water_mesh,
+                    grow_spray_mesh,
+                )
                     .chain()
                     .after(crate::handle_keys),
             );
     }
+
+    fn finish(&self, app: &mut App) {
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            // Lets the GPU surface write straight into the water mesh's vertex
+            // buffer, as Bevy's `compute_mesh` example does.
+            render_app
+                .world_mut()
+                .resource_mut::<MeshAllocatorSettings>()
+                .extra_buffer_usages |= BufferUsages::STORAGE;
+        }
+    }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Bevy injects resources as independent system parameters"
+)]
 fn spawn_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -93,6 +177,7 @@ fn spawn_scene(
     mut images: ResMut<Assets<Image>>,
     fluid: Res<Fluid>,
     config: Res<Config>,
+    gpu: Option<Res<GpuFluid>>,
 ) {
     commands.spawn((
         DirectionalLight {
@@ -128,19 +213,37 @@ fn spawn_scene(
     ));
 
     let mut surface = Surface::new(b, config.fluid.spacing, config.render.surface_resolution);
-    let mesh = meshes.add(surface.rebuild(&fluid));
+    let first = surface.rebuild(&fluid);
     let [x, y, z] = surface.dims.map(|v| v as u32);
-    let mut volume = Image::new(
-        Extent3d {
-            width: x,
-            height: y,
-            depth_or_array_layers: z,
-        },
-        TextureDimension::D3,
-        surface.texture_bytes(),
-        TextureFormat::R8Unorm,
-        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-    );
+    let extent = Extent3d {
+        width: x,
+        height: y,
+        depth_or_array_layers: z,
+    };
+    let (mesh, mut volume) = if gpu.is_some() {
+        // Empty, and never touched again from here: the GPU fills both. The
+        // first CPU rebuild only sizes the mesh.
+        let capacity = (surface.triangles as u32 * 5 / 4).max(1 << 14);
+        commands.insert_resource(WaterCapacity(capacity));
+        let mut volume = Image::new_fill(
+            extent,
+            TextureDimension::D3,
+            &[0; 4],
+            DENSITY_FORMAT,
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        volume.texture_descriptor.usage |= TextureUsages::STORAGE_BINDING;
+        (meshes.add(empty_water_mesh(capacity)), volume)
+    } else {
+        let volume = Image::new(
+            extent,
+            TextureDimension::D3,
+            surface.texture_bytes(),
+            TextureFormat::R8Unorm,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        (meshes.add(first), volume)
+    };
     volume.sampler = ImageSampler::linear();
     let density = images.add(volume);
     let rgb = |v: [f32; 3]| Color::srgb(v[0], v[1], v[2]).to_linear();
@@ -182,7 +285,22 @@ fn spawn_scene(
         perceptual_roughness: 0.3,
         ..default()
     });
-    for (i, p) in fluid.pos.iter().enumerate() {
+    // The GPU solver keeps its particles on the GPU, and draws them as one mesh
+    // written there; entities here would read positions that never change.
+    let cpu_particles = if gpu.is_some() {
+        let droplets = 1 << 12;
+        let mesh = meshes.add(empty_spray_mesh(droplets));
+        commands.spawn((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(particle_material.clone()),
+            NoFrustumCulling,
+        ));
+        commands.insert_resource(SprayMesh { mesh, droplets });
+        0
+    } else {
+        fluid.len()
+    };
+    for (i, p) in fluid.pos.iter().take(cpu_particles).enumerate() {
         commands.spawn((
             Mesh3d(sphere.clone()),
             MeshMaterial3d(particle_material.clone()),
@@ -208,9 +326,25 @@ fn sync_surface(
     fixed: Res<Time<Fixed>>,
     paused: Res<crate::Paused>,
     capture: Option<Res<crate::Capture>>,
+    gpu: Option<Res<GpuFluid>>,
+    status: Res<SurfaceStatus>,
+    mut rebuilds: Local<u32>,
 ) {
     let frozen = paused.0 || capture.as_ref().is_some_and(|c| c.reached(fluid.elapsed));
     if !fluid.is_changed() && frozen {
+        return;
+    }
+    if gpu.is_some() {
+        // Rebuilt during extraction; only the clock and the timing live here.
+        if let Some(mut material) = materials.get_mut(&assets.material) {
+            material.clock_floor.x = fluid.elapsed;
+        }
+        let latest = status.0.rebuilds.load(Ordering::Relaxed);
+        if latest != *rebuilds {
+            *rebuilds = latest;
+            let ms = f32::from_bits(status.0.milliseconds.load(Ordering::Relaxed));
+            crate::Timings::feed(&mut timing.0, ms);
+        }
         return;
     }
     let start = std::time::Instant::now();
@@ -231,6 +365,183 @@ fn sync_surface(
         material.clock_floor.x = fluid.elapsed;
     }
     crate::Timings::feed(&mut timing.0, start.elapsed().as_secs_f32() * 1000.0);
+}
+
+/// A water mesh with room for `triangles`, all collapsed to the origin.
+fn empty_water_mesh(triangles: u32) -> Mesh {
+    let vertices = 3 * triangles as usize;
+    let mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; vertices])
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32; 3]; vertices])
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, vec![[0.0f32; 4]; vertices]);
+    // `surface.wgsl` writes vertices in exactly this layout.
+    assert_eq!(mesh.get_vertex_size(), crate::surface_gpu::VERTEX_BYTES);
+    mesh
+}
+
+/// A spray mesh with room for `droplets`, all collapsed to the origin.
+fn empty_spray_mesh(droplets: u32) -> Mesh {
+    let vertices = (DROPLET_VERTICES * droplets) as usize;
+    let mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; vertices])
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32; 3]; vertices]);
+    // `spray.wgsl` writes vertices in exactly this layout.
+    assert_eq!(mesh.get_vertex_size(), crate::spray_gpu::VERTEX_BYTES);
+    mesh
+}
+
+fn grow_spray_mesh(
+    status: Res<SurfaceStatus>,
+    spray: Option<ResMut<SprayMesh>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let Some(mut spray) = spray else {
+        return;
+    };
+    let needed = status.0.droplets.load(Ordering::Relaxed).min(MAX_DROPLETS);
+    if needed > spray.droplets {
+        spray.droplets = (needed + needed / 2).min(MAX_DROPLETS);
+        let mesh = empty_spray_mesh(spray.droplets);
+        meshes
+            .insert(&spray.mesh, mesh)
+            .expect("the spray mesh handle is live");
+    }
+}
+
+/// Replaces the GPU-written water mesh with a larger one when the surface has
+/// outgrown it. Until then the triangles past its end are not drawn.
+fn grow_water_mesh(
+    status: Res<SurfaceStatus>,
+    capacity: Option<ResMut<WaterCapacity>>,
+    assets: Res<WaterAssets>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let Some(mut capacity) = capacity else {
+        return;
+    };
+    let needed = status.0.triangles.load(Ordering::Relaxed);
+    if needed > capacity.0 {
+        capacity.0 = needed + needed / 2;
+        info!("water surface needs {needed} triangles; growing its mesh to {}", capacity.0);
+        meshes
+            .insert(&assets.mesh, empty_water_mesh(capacity.0))
+            .expect("the water mesh handle is live");
+    }
+}
+
+/// What the last GPU rebuild was built from: fluid generation, clock, the point
+/// between steps, both meshes' capacities, and the diagnostic view.
+type RebuildKey = (u64, u32, u32, u32, u32, bool);
+
+/// The GPU surface and spray, rebuilt during extraction. Extraction runs after
+/// this frame's solver steps were submitted and before anything draws the
+/// frame, and the render thread cannot start the next frame's extraction until
+/// this frame is drawn, so what is drawn is always built from the steps before
+/// it, whatever the solver does in the meantime.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Bevy injects resources as independent system parameters"
+)]
+fn rebuild_on_gpu(
+    fluid: Extract<Res<Fluid>>,
+    solver: Extract<Option<Res<GpuFluid>>>,
+    assets: Extract<Option<Res<WaterAssets>>>,
+    spray_mesh: Extract<Option<Res<SprayMesh>>>,
+    mode: Extract<Res<DiagnosticView>>,
+    config: Extract<Res<Config>>,
+    fixed: Extract<Res<Time<Fixed>>>,
+    paused: Extract<Res<crate::Paused>>,
+    capture: Extract<Option<Res<crate::Capture>>>,
+    allocator: Res<MeshAllocator>,
+    images: Res<RenderAssets<GpuImage>>,
+    status: Res<SurfaceStatus>,
+    mut builders: Local<Option<(GpuSurface, GpuSpray)>>,
+    mut built: Local<Option<RebuildKey>>,
+) {
+    let (Some(solver), Some(assets), Some(spray_mesh)) =
+        (solver.as_ref(), assets.as_ref(), spray_mesh.as_ref())
+    else {
+        return;
+    };
+    let (Some(water), Some(droplets), Some(image)) = (
+        allocator.mesh_vertex_slice(&assets.mesh.id()),
+        allocator.mesh_vertex_slice(&spray_mesh.mesh.id()),
+        images.get(&assets.density),
+    ) else {
+        // Not allocated or uploaded yet: the first frame or two, or a mesh
+        // that has just grown.
+        return;
+    };
+    let frozen = paused.0 || capture.as_ref().is_some_and(|c| c.reached(fluid.elapsed));
+    let alpha = if frozen { 1.0 } else { fixed.overstep_fraction() };
+    let water_capacity = water.range.end - water.range.start;
+    let droplet_capacity = (droplets.range.end - droplets.range.start) / DROPLET_VERTICES;
+    let key = (
+        fluid.generation,
+        fluid.elapsed.to_bits(),
+        alpha.to_bits(),
+        water_capacity,
+        droplet_capacity,
+        mode.0,
+    );
+    if *built == Some(key) {
+        return;
+    }
+    if builders
+        .as_ref()
+        .is_none_or(|(surface, spray)| !surface.matches(solver) || !spray.matches(solver))
+    {
+        let layout = SurfaceLayout::new(
+            config.bounds(),
+            config.fluid.spacing,
+            config.render.surface_resolution,
+        );
+        *builders = Some((
+            GpuSurface::new(solver, &layout, config.bounds()),
+            GpuSpray::new(solver),
+        ));
+    }
+    let (surface, spray) = builders.as_ref().unwrap();
+    let start = std::time::Instant::now();
+    let triangles = surface.rebuild(
+        solver,
+        alpha,
+        &SurfaceTarget {
+            vertices: water.buffer,
+            start: water.range.start,
+            capacity: water_capacity,
+            density: &image.texture_view,
+        },
+    );
+    let style = SprayStyle {
+        radius: config.fluid.spacing * 0.3,
+        scale: config.render.particle_scale / 2.4,
+        diagnostic: mode
+            .0
+            .then(|| (solver.len() as u32).div_ceil(MAX_DROPLETS).max(1)),
+    };
+    let wanted = spray.rebuild(
+        solver,
+        alpha,
+        style,
+        droplets.buffer,
+        droplets.range.start,
+        droplet_capacity,
+    );
+    let counters = &status.0;
+    counters.triangles.store(triangles, Ordering::Relaxed);
+    counters.droplets.store(wanted, Ordering::Relaxed);
+    counters
+        .milliseconds
+        .store((start.elapsed().as_secs_f32() * 1000.0).to_bits(), Ordering::Relaxed);
+    counters.rebuilds.fetch_add(1, Ordering::Relaxed);
+    *built = Some(key);
 }
 
 fn toggle_diagnostics(

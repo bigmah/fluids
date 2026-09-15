@@ -1,5 +1,5 @@
 # Original wide swell tank: about 69,000 particles and a finer surface mesh.
-# Run with `cargo run --release -- wide.toml`; this costs more CPU time.
+# Run with `cargo run --release -- wide.toml`; this costs more to simulate.
 #
 # Same swell as config.toml, seen across a much wider crest. For a longer
 # period and fewer, larger waves, see `groundswell.toml`: period cannot be
@@ -36,6 +36,7 @@ spacing = 8.0
 smoothing_radius = 16.0
 
 [solver]
+backend = "gpu"
 substeps = 1
 iterations = 16
 jacobi_relax = 0.5

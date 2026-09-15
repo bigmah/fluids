@@ -299,19 +299,19 @@ impl Solitary {
 /// https://github.com/DualSPHysics/DualSPHysics/wiki/3.-SPH-formulation#3132-relaxation-zone-rz
 #[derive(Debug, Clone, Copy)]
 pub struct Wavemaker {
-    origin_x: f32,
-    amplitude: f32,
-    omega: f32,
-    k: f32,
+    pub(crate) origin_x: f32,
+    pub(crate) amplitude: f32,
+    pub(crate) omega: f32,
+    pub(crate) k: f32,
     /// A single wave replaces the swell, so nothing is generated.
-    single: Option<Solitary>,
-    direction: Vec3,
-    depth: f32,
-    level: f32,
-    generation_width: f32,
+    pub(crate) single: Option<Solitary>,
+    pub(crate) direction: Vec3,
+    pub(crate) depth: f32,
+    pub(crate) level: f32,
+    pub(crate) generation_width: f32,
     pub period: f32,
-    beach_start: f32,
-    beach_width: f32,
+    pub(crate) beach_start: f32,
+    pub(crate) beach_width: f32,
 }
 
 impl Wavemaker {
@@ -387,7 +387,7 @@ impl Wavemaker {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{config::Config, sim::Fluid};
 
@@ -632,7 +632,7 @@ mod tests {
     /// cells of air before more water or the bed. Returns each column's centre.
     /// A cell counts as water with three tenths of a full row of particles, so
     /// spray does not register as a lip.
-    fn overturned_columns(fluid: &Fluid, wave: Wave) -> Vec<f32> {
+    pub(crate) fn overturned_columns(fluid: &Fluid, wave: Wave) -> Vec<f32> {
         let (b, d) = (fluid.params.bounds, fluid.params.spacing);
         let nx = (b.size().x / d).ceil() as usize;
         let ny = (b.size().y / d).ceil() as usize;

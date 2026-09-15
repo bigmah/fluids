@@ -45,19 +45,18 @@ impl Triangles {
     }
 }
 
-#[derive(Resource)]
-pub struct Surface {
+/// Where the voxels of a reconstruction sit, and the kernel sampled at them.
+#[derive(Clone, Copy)]
+pub struct SurfaceLayout {
     pub origin: Vec3,
     pub cell: f32,
     pub dims: [usize; 3],
-    radius: f32,
-    reference: f32,
-    grid: Grid,
-    samples: Vec<Sample>,
-    pub triangles: usize,
+    pub radius: f32,
+    /// The kernel summed over a rest lattice: the density that reads as 1.
+    pub reference: f32,
 }
 
-impl Surface {
+impl SurfaceLayout {
     pub fn new(bounds: Bounds, spacing: f32, resolution: f32) -> Self {
         let radius = spacing * 2.4;
         let cell = spacing * resolution;
@@ -82,9 +81,45 @@ impl Surface {
             dims,
             radius,
             reference,
-            grid: Grid::new(bounds, radius),
-            samples: vec![Sample::default(); dims.iter().product()],
+        }
+    }
+}
+
+#[derive(Resource)]
+pub struct Surface {
+    pub origin: Vec3,
+    pub cell: f32,
+    pub dims: [usize; 3],
+    radius: f32,
+    reference: f32,
+    grid: Grid,
+    samples: Vec<Sample>,
+    pub triangles: usize,
+}
+
+impl Surface {
+    pub fn new(bounds: Bounds, spacing: f32, resolution: f32) -> Self {
+        let layout = SurfaceLayout::new(bounds, spacing, resolution);
+        Self {
+            origin: layout.origin,
+            cell: layout.cell,
+            dims: layout.dims,
+            radius: layout.radius,
+            reference: layout.reference,
+            grid: Grid::new(bounds, layout.radius),
+            samples: vec![Sample::default(); layout.dims.iter().product()],
             triangles: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn layout(&self) -> SurfaceLayout {
+        SurfaceLayout {
+            origin: self.origin,
+            cell: self.cell,
+            dims: self.dims,
+            radius: self.radius,
+            reference: self.reference,
         }
     }
 
@@ -93,6 +128,13 @@ impl Surface {
             .iter()
             .map(|s| (s.density.clamp(0.0, 1.0) * 255.0) as u8)
             .collect()
+    }
+
+    /// Density, unnormalised normal and foam at every voxel, for checking the
+    /// GPU reconstruction against this one.
+    #[cfg(test)]
+    pub(crate) fn samples(&self) -> impl Iterator<Item = (f32, Vec3, f32)> + '_ {
+        self.samples.iter().map(|s| (s.density, s.normal, s.foam))
     }
 
     #[cfg(test)]

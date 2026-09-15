@@ -102,9 +102,21 @@ pub struct FluidBlock {
     pub smoothing_radius: f32,
 }
 
+/// Where the solver runs. Both compute the same substep; see `sim_gpu`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    #[default]
+    Gpu,
+    Cpu,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Solver {
+    /// `gpu` runs the solver as compute shaders on the renderer's device; `cpu`
+    /// runs the reference implementation in `sim.rs` on every core.
+    pub backend: Backend,
     /// Jacobi iterations per substep. Drives compression down roughly
     /// linearly, at a matching cost.
     pub iterations: u32,
@@ -194,6 +206,7 @@ impl Default for FluidBlock {
 impl Default for Solver {
     fn default() -> Self {
         Self {
+            backend: Backend::Gpu,
             iterations: 8,
             substeps: 1,
             jacobi_relax: 0.5,

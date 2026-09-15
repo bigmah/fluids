@@ -85,8 +85,8 @@ spilling below and a collapsing bore above. The preset sits at 0.25; the same
 wave on a 1:5 slope (0.39) collapses without a lip. The lip throws about 13
 simulated seconds in, first at the far wall: the reef is skewed slightly, so the
 barrel peels across the 1200-unit crest toward the camera. It is about 1.3
-million particles, around half a second per solver step on an M4 Pro, so the
-break takes several minutes to arrive; `world.depth = 200` is the same break
+million particles: a solver step takes about 80 ms on an M4 Pro's GPU and 400 on
+its CPU, so the break takes about a minute to arrive on the GPU; `world.depth = 200` is the same break
 across a narrow strip at a sixth of the cost.
 
 For the original short-period swell across a much wider crest:
@@ -132,16 +132,19 @@ Useful settings in `config.toml`:
 | `wave.beach_width` | Fraction of tank width used to damp shoreward wash |
 | `scene.time_scale` | Playback speed, without changing the physics timestep |
 | `scene.replay_after` | Replay interval in simulated seconds; `0` disables it |
-| `render.surface_resolution` | Mesh voxel size / particle spacing; smaller costs more CPU |
+| `solver.backend` | `gpu` (the default) or `cpu`; see [On the GPU](#on-the-gpu) |
+| `render.surface_resolution` | Mesh voxel size / particle spacing; smaller costs more to rebuild |
 | `render.foam_speed` | Foam visibility calibration; lower makes more foam visible |
 
 Slow motion scales the simulation clock. The renderer interpolates particle
 positions between fixed solver steps, so slowing playback does not increase
 viscosity or artificial pressure.
 
-The solver and surface reconstruction both run on the CPU;
-the title reports their costs separately. The historical solver benchmarks below
-refer to the dam break, before surface reconstruction was added.
+The solver, surface reconstruction and spray run on the GPU by default, and all
+on the CPU with `solver.backend = "cpu"`; the title names which, and reports the
+solver's and the surface's costs separately. The historical solver benchmarks
+below refer to the CPU solver on the dam break, before surface reconstruction
+was added.
 
 The default uses a `1400 × 720 × 140` tank with about 22,000 particles, against
 68,900 in `wide.toml`. Most of that saving is the narrower crest, and the rest is
@@ -250,6 +253,72 @@ radius, so a dense grid beats a spatial hash: no modulo, no collisions, and
 neighbours land contiguously in memory. Neighbour lists are built once per
 substep and reused across all solver iterations.
 
+## On the GPU
+
+`solver.backend = "gpu"`, the default, runs the same solver as compute shaders on
+the renderer's own device: `sim.wgsl` is `sim.rs` pass for pass, with the same
+kernels, the same order of operations and the same arithmetic, and the CPU
+solver stays as the reference it is checked against. The particles never come
+back to the CPU. Each frame, during Bevy's extraction, `surface.wgsl` samples
+them into the density grid, writes the water shader's volume texture, and runs
+marching tetrahedra straight into the water mesh's vertex buffer; `spray.wgsl`
+writes the spray droplets into another mesh the same way. Extraction sits after
+the frame's solver steps and before anything draws it, so the render thread can
+never draw a surface built from a later step. The mouse ray and the title's
+compression, bulk density and peak speed are queried from the GPU too, as a
+parallel reduction that reads back one value.
+
+Three details decide whether the GPU agrees with the CPU at all:
+
+**Neighbour order.** The neighbour grid is rebuilt by a counting sort: count
+particles per cell atomically, prefix-sum the counts in place (a Blelloch scan),
+then scatter. The scatter lands particles in their cells in whatever order the
+threads ran, so each cell is then sorted back into index order. That makes the
+neighbour lists identical to the CPU's, order included, and since a sum over
+neighbours rounds according to its order, it is what makes a GPU run repeat
+exactly and track the CPU within rounding.
+
+**Fixed-capacity lists.** The CPU sizes its neighbour lists exactly; the GPU gives
+every particle a fixed number of slots, twice the kernel ball's volume in rest
+spacings, so nothing has to be read back per substep to size a buffer. The
+largest neighbourhood is tracked every step, and the lists grow if it is ever
+exceeded.
+
+**Memory order.** Particles start numbered in fill order, which puts neighbours
+near each other in memory, and the flow scrambles it: ten seconds into
+`slab.toml` a step cost twice what the first did, with the same neighbour
+counts. So every step the particles are renumbered into the previous grid's cell
+order, on the GPU, and a slot-to-particle map carries them back to `Fluid`'s
+numbering whenever they are read. Steps now cost the same late in the break as
+at the start.
+
+**What "matches" means.** Metal compiles with fast-math, so single steps agree to
+rounding rather than bit for bit — about 5×10⁻⁵ of a particle spacing. Over
+time no two runs of this flow can be compared particle for particle: nudge the
+CPU's own starting positions by 2×10⁻⁵ of a spacing and it parts company with
+itself by 2.5 spacings within a second, the same rate the GPU parts from it. So
+the GPU is held to what does hold: a step from the CPU's exact state has to agree
+all the way through the break, and a GPU run left to itself has to throw its lip
+over the reef when the CPU's does.
+
+Cost on an M4 Pro, from `cargo test --release speedup -- --ignored --nocapture`
+for a solver step and `surface_cost` for rebuilding the surface, CPU against GPU:
+
+| preset | particles | solver step | surface rebuild |
+|---|---|---|---|
+| `config.toml` | 22,078 | 11.8 → 3 ms | 3.5 → 2.9 ms |
+| `wide.toml` | 68,909 | 30.5 → 4.5 ms | 13.6 → 4.9 ms |
+| `slab.toml` | 1,306,995 | 385 → 75 ms | 80 → 18 ms |
+
+A small tank is mostly fixed cost on the GPU — dozens of dispatches and a wait
+per step — so the gain grows with the particle count. The CPU renderer also
+uploads the rebuilt mesh every frame, a million triangles at `slab.toml`'s scale,
+and draws its spray as a million entities; with the GPU backend neither leaves
+the GPU. In the app, `slab.toml` reaches 17 simulated seconds in 90 seconds of
+wall-clock time on the GPU, against 2 on the CPU. Nine tenths of a GPU step is
+the Jacobi iterations (`profile_phases` breaks it down), so `solver.iterations`
+is the knob that moves it.
+
 ## Turning the particle count up
 
 There are two knobs, and they do different things.
@@ -306,7 +375,7 @@ not measured guarantees at the reef. Numerical dissipation and finite tank walls
 still affect the arriving swell, especially at large angles. The damping beach
 reduces reflections but is not a perfect open boundary. Entrained air and bubble
 pressure are outside this solver. Thin lips need several particle layers to
-survive reconstruction, so finer spacing costs substantially more CPU time.
+survive reconstruction, so finer spacing costs substantially more.
 
 **Approximate solid support in the wave scene.** The density constraint includes
 an analytical estimate of kernel volume inside the reef and tank walls, using
@@ -322,10 +391,14 @@ shallower than its rest volume implies.
 | file | |
 |---|---|
 | `src/sim.rs` | the solver — no rendering, no ECS in the hot path |
+| `src/sim_gpu.rs`, `src/sim.wgsl` | the same solver as compute shaders, and its readouts |
+| `src/gpu.rs` | the compute device, shared with the renderer, and pipeline helpers |
 | `src/config.rs` | the `config.toml` format, its defaults, and validation |
 | `src/wave.rs` | directional swell generation, dispersion, and shared reef geometry |
 | `src/surface.rs` | parallel density sampling and 3D surface reconstruction |
-| `src/render.rs` | surface/volume uploads, reef, spray, diagnostic view |
+| `src/surface_gpu.rs`, `src/surface.wgsl` | the same reconstruction on the GPU, written into the water mesh |
+| `src/spray_gpu.rs`, `src/spray.wgsl` | spray and the particle diagnostic, written into a mesh on the GPU |
+| `src/render.rs` | surface/volume uploads or GPU rebuilds, reef, spray, diagnostic view |
 | `src/water.wgsl` | water absorption, reflections, light transmission, foam |
 | `src/camera.rs` | orbit camera |
 | `src/main.rs` | app wiring, input, window title readout |
@@ -336,9 +409,12 @@ keeps sections like `[render]` out of the physics. `Config::default()` retains
 the original dam-break defaults for compatibility; the shipped `config.toml`
 selects the reef wave tank. Both configurations have physical regression tests.
 
-The main water surface is one mesh/material. Spray and the particle diagnostic
-share a small sphere mesh and material so they can be instanced. The water
-shader is embedded in the executable; no external art assets are needed.
+The main water surface is one mesh/material. With the CPU solver, spray and the
+particle diagnostic share a small sphere mesh and material so they can be
+instanced; with the GPU solver they are one mesh of small octahedra written in
+place, since a million entities is more than the ECS wants to carry. Past
+131,072 particles the diagnostic view shows an even sample of them. The shaders
+are embedded in the executable; no external art assets are needed.
 
 ## Tests
 
@@ -378,6 +454,27 @@ can be wrong in ways that still compile and still produce plausible motion:
 - `a_single_wave_is_validated_on_its_own_terms` — the swell's period and
   wavelength limits do not apply to a single wave, but its own do.
 
+The GPU has its own, each against the CPU as the reference. They skip, with a
+note, on a machine with no GPU adapter:
+
+- `neighbour_search_matches_the_cpu_exactly` — from identical positions, the GPU
+  grid and neighbour lists equal the CPU's, order included.
+- `one_step_matches_the_cpu` — from the same state, one step agrees in position,
+  velocity, foam and spray on the dam break (with a mouse push), the swell flume
+  mid-generation and the slab flume, and the GPU readouts agree with the CPU's.
+- `the_slab_flume_matches_the_cpu_through_the_break` — a GPU step from the CPU's
+  exact state agrees every half second through the break, and a free GPU run
+  throws its lip within half a second of the CPU's (13.1 against 13.0 s).
+- `gpu_runs_repeat_exactly` — bit-identical replays, including after a reset.
+- `renumbering_keeps_every_particle_its_own` — a step taken after the particles
+  are shuffled into grid order agrees, particle for particle, with one taken
+  without.
+- `crowded_neighbourhoods_widen_the_lists` — overfull neighbour lists grow, and
+  the solver matches again once they have.
+- `gpu_surface_matches_the_cpu` — voxel for voxel and triangle for triangle.
+- `droplets_mark_the_spray` — droplets sit on the spray, face outwards, stretch
+  with speed, and the diagnostic samples by stride.
+
 For repeatable GPU screenshots (the app renders, saves, and exits):
 
 ```
@@ -407,12 +504,17 @@ for the tank reports the largest that fits, and `required_substeps_is_enough_to_
 checks that the number the error message tells you to set actually works at
 every spacing — advice that is wrong is worse than no advice.
 
-Three ignored tests are diagnostics rather than assertions:
+The ignored tests are diagnostics rather than assertions:
 
 ```
-cargo test --release report  -- --ignored --nocapture   # trace + ms/step
-cargo test --release sweep   -- --ignored --nocapture   # parameter sweep
-cargo test --release scaling -- --ignored --nocapture   # cost vs particle count
+cargo test --release report  -- --ignored --nocapture          # trace + ms/step
+cargo test --release sweep   -- --ignored --nocapture          # parameter sweep
+cargo test --release scaling -- --ignored --nocapture          # cost vs particle count
+cargo test --release speedup -- --ignored --nocapture          # CPU against GPU per step
+cargo test --release sensitivity -- --ignored --nocapture      # GPU drift against the CPU's own
+cargo test --release profile_phases -- --ignored --nocapture   # GPU time per solver pass
+cargo test --release sustained -- --ignored --nocapture        # GPU step cost as the break develops
+cargo test --release surface_cost -- --ignored --nocapture     # CPU against GPU surface rebuild
 ```
 
 `scaling` produced the table above. `sweep` is how the defaults were chosen: it

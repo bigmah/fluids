@@ -46,11 +46,11 @@ impl Bounds {
 /// over a ball, so they are genuinely different numbers -- carrying the 2D ones
 /// into 3D would leave the rest density silently wrong.
 #[derive(Clone, Copy)]
-struct Kernels {
-    h: f32,
-    h2: f32,
-    poly6: f32,
-    spiky: f32,
+pub(crate) struct Kernels {
+    pub(crate) h: f32,
+    pub(crate) h2: f32,
+    pub(crate) poly6: f32,
+    pub(crate) spiky: f32,
 }
 
 impl Kernels {
@@ -241,26 +241,28 @@ pub struct Fluid {
     /// Detached particle fraction, used to draw spray smaller than the mesh.
     pub spray: Vec<f32>,
     pub wave: Option<crate::wave::Wave>,
-    wavemaker: Option<crate::wave::Wavemaker>,
+    pub(crate) wavemaker: Option<crate::wave::Wavemaker>,
     pub elapsed: f32,
+    /// Bumped by every reset, so a GPU copy of the particles knows to reload.
+    pub(crate) generation: u64,
     /// Predicted positions, which the constraint solver actually moves.
     pred: Vec<Vec3>,
     lambda: Vec<f32>,
     delta: Vec<Vec3>,
     vel_scratch: Vec<Vec3>,
     boundary: Vec<(f32, Vec3)>,
-    kernels: Kernels,
+    pub(crate) kernels: Kernels,
     grid: Grid,
     /// Neighbour lists, flattened. Built once per substep and reused across all
     /// solver iterations, which is where most of the speed comes from.
-    neighbors: Vec<u32>,
-    neighbor_start: Vec<u32>,
+    pub(crate) neighbors: Vec<u32>,
+    pub(crate) neighbor_start: Vec<u32>,
     /// Calibrated from the rest lattice, see [`lattice_reference`].
-    rest_density: f32,
-    epsilon: f32,
-    tensile_scale: f32,
+    pub(crate) rest_density: f32,
+    pub(crate) epsilon: f32,
+    pub(crate) tensile_scale: f32,
     /// Poly6 evaluated at `tensile_q * h`, the artificial pressure reference.
-    tensile_w: f32,
+    pub(crate) tensile_w: f32,
 }
 
 impl Fluid {
@@ -277,6 +279,7 @@ impl Fluid {
             wave: None,
             wavemaker: None,
             elapsed: 0.0,
+            generation: 0,
             pred: Vec::new(),
             lambda: Vec::new(),
             delta: Vec::new(),
@@ -367,6 +370,7 @@ impl Fluid {
         self.foam = vec![0.0; n];
         self.spray = vec![0.0; n];
         self.elapsed = 0.0;
+        self.generation += 1;
         self.pred = vec![Vec3::ZERO; n];
         self.lambda = vec![0.0; n];
         self.delta = vec![Vec3::ZERO; n];
@@ -583,6 +587,17 @@ impl Fluid {
                 });
             }
         });
+    }
+
+    /// Builds neighbour lists straight from `positions`, as a substep does from
+    /// its predictions, so another implementation of the search can be checked
+    /// against this one on identical input.
+    #[cfg(test)]
+    pub(crate) fn build_neighbors_from(&mut self, positions: &[Vec3]) {
+        self.pred.clear();
+        self.pred.extend_from_slice(positions);
+        self.grid.rebuild(&self.pred);
+        self.build_neighbors();
     }
 
     fn solve_density(&mut self) {
