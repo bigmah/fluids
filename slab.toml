@@ -1,8 +1,10 @@
-# One big wave, plunging over a shallow reef. Run with
+# One big wave, plunging along a wide crest over a shallow reef. Run with
 # `cargo run --release -- slab.toml`. The lip throws about 13 simulated seconds
-# in, with a barrel by 14; S slows playback for it. This costs far more CPU
-# time than config.toml: about 100 ms per solver step on an M4 Pro, so it plays
-# well below real time. For a video, see the capture section of the README.
+# in, with a barrel the whole way across by 14; S slows playback for it. This
+# costs far more CPU time than config.toml: about half a second per solver step
+# on an M4 Pro, so the break takes several minutes to arrive. For a video, see
+# the capture section of the README. For quick experiments, world.depth = 200
+# is the same break across a narrow strip, at a sixth of the cost.
 #
 # config.toml sends an endless swell at an abrupt ledge, and at that tank's
 # proportions the swell collapses into a white bore instead of pitching: a
@@ -37,13 +39,17 @@ direction = 0.0
 water_depth = 200.0
 # 25 units of water over the shelf: about three particle layers.
 reef_height = 175.0
-# The reef starts 1602 units in, which leaves room for the whole wave.
+# The reef starts 1602 units in at the middle of the crest and 1542 at the far
+# wall, which still leaves room for the whole wave.
 reef_start = 0.445
 # 1404 units of run for 175 of rise: the 1:8 slope.
 reef_width = 0.39
-# A little skew, so the lip lands progressively along the crest.
-reef_skew = 0.15
-# Starts 234 units past the top of the reef, beyond where the lip lands.
+# Moves the reef 60 units offshore at the far wall and 60 inshore at the near
+# one, so the far end throws first and the barrel peels toward the camera,
+# crossing the crest in under a second.
+reef_skew = 0.10
+# Starts 174 to 294 units past the top of the reef, beyond where the lip first
+# throws.
 beach_width = 0.10
 
 [world]
@@ -51,12 +57,13 @@ beach_width = 0.10
 # unit, a 13-metre wave in 22 metres of water breaking onto a 3-metre shelf.
 width = 3600.0
 height = 460.0
-depth = 200.0
+# The length of the crest: ten times the wave's height.
+depth = 1200.0
 gravity = [0.0, -90.0, 0.0]
 
 [fluid]
 # Finer than config.toml: the lip is only a few particles thick at 14.
-# About 218,000 particles.
+# About 1.3 million particles.
 spacing = 8.0
 smoothing_radius = 16.0
 

@@ -66,8 +66,8 @@ wavelength and 3500 of depth to simulate. It is the same physics at a different
 scale — against real gravity the preset is 0.109 m per world unit, a 100-metre,
 8-second, 11-metre swell breaking over a 3-metre shelf.
 
-For one big wave that actually plunges, throwing a lip and a barrel onto a
-shallow reef:
+For one big wave that actually plunges, throwing a lip and a barrel along a wide
+crest onto a shallow reef:
 
 ```
 cargo run --release -- slab.toml
@@ -83,8 +83,11 @@ is no generation zone and no period. Whether it plunges follows Grilli et al.
 (1997): plunging for `0.025 < 1.521 · slope / sqrt(height / depth) < 0.3`, with
 spilling below and a collapsing bore above. The preset sits at 0.25; the same
 wave on a 1:5 slope (0.39) collapses without a lip. The lip throws about 13
-simulated seconds in. It is about 218,000 particles, so it runs well below real
-time.
+simulated seconds in, first at the far wall: the reef is skewed slightly, so the
+barrel peels across the 1200-unit crest toward the camera. It is about 1.3
+million particles, around half a second per solver step on an M4 Pro, so the
+break takes several minutes to arrive; `world.depth = 200` is the same break
+across a narrow strip at a sixth of the cost.
 
 For the original short-period swell across a much wider crest:
 

@@ -64,9 +64,11 @@ fn spawn_camera(mut commands: Commands, config: Res<Config>) {
         // big it is. This one sits close enough to the reef that the offshore
         // half runs off the sides, and frames at most four tank-heights of a
         // long tank, so a long approach does not push the break into the
-        // distance. Scroll still zooms.
+        // distance. It stands back a little further than a wide tank is deep,
+        // so a long crest runs away from the camera instead of starting right
+        // under it. Scroll still zooms.
         radius: if wave {
-            Vec3::new(size.x.min(4.0 * size.y), size.y, size.z).length() * 0.38
+            (Vec3::new(size.x.min(4.0 * size.y), size.y, size.z).length() * 0.38).max(size.z * 1.15)
         } else {
             size.length() * 1.05
         },
