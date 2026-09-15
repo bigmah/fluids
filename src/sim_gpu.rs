@@ -4,7 +4,7 @@
 //! holds the parameters, and still steps on the CPU when asked to. This runs
 //! the same substep as compute passes in `sim.wgsl`. The particles stay on the
 //! GPU, where the surface and spray are built from them (`surface_gpu.rs`,
-//! `spray_gpu.rs`), and where the mouse and the window title query them. Only
+//! `spray_gpu.rs`), and where the window title queries them. Only
 //! the tests copy them back.
 //!
 //! The one structural difference is the neighbour lists. The CPU counts first
@@ -52,8 +52,6 @@ struct GpuParams {
     gravity: [f32; 4],
     grid_origin: [f32; 4],
     direction: [f32; 4],
-    impulse: [f32; 4],
-    ray: [f32; 4],
     n: u32,
     capacity: u32,
     dims_x: i32,
@@ -80,7 +78,6 @@ struct GpuParams {
     viscosity: f32,
     speed_scale: f32,
     interior_scale: f32,
-    strength: f32,
     reef_height: f32,
     reef_start: f32,
     reef_width: f32,
@@ -95,10 +92,10 @@ struct GpuParams {
     period: f32,
     beach_start: f32,
     beach_width: f32,
-    _pad: [f32; 3],
+    _pad: [f32; 4],
 }
 
-const _: () = assert!(size_of::<GpuParams>() == 336);
+const _: () = assert!(size_of::<GpuParams>() == 304);
 
 /// `Level` in `sim.wgsl`.
 #[repr(C)]
@@ -155,7 +152,6 @@ enum Slot {
 /// A compute pass: one entry point in `sim.wgsl`, and the bindings it touches.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Pass {
-    Impulse,
     Predict,
     Bin,
     Count,
@@ -171,15 +167,12 @@ enum Pass {
     MeasureTop,
     Measure,
     Reduce,
-    RayHits,
-    ReduceNearest,
     GatherVectors,
     GatherScalars,
 }
 
 impl Pass {
-    const ALL: [Pass; 20] = [
-        Pass::Impulse,
+    const ALL: [Pass; 17] = [
         Pass::Predict,
         Pass::Bin,
         Pass::Count,
@@ -195,8 +188,6 @@ impl Pass {
         Pass::MeasureTop,
         Pass::Measure,
         Pass::Reduce,
-        Pass::RayHits,
-        Pass::ReduceNearest,
         Pass::GatherVectors,
         Pass::GatherScalars,
     ];
@@ -212,7 +203,6 @@ impl Pass {
 
     fn entry(self) -> &'static str {
         match self {
-            Pass::Impulse => "apply_impulse",
             Pass::Predict => "predict",
             Pass::Bin => "bin_particles",
             Pass::Count => "count_cells",
@@ -228,8 +218,6 @@ impl Pass {
             Pass::MeasureTop => "measure_top",
             Pass::Measure => "measure",
             Pass::Reduce => "reduce",
-            Pass::RayHits => "ray_hits",
-            Pass::ReduceNearest => "reduce_nearest",
             Pass::GatherVectors => "gather_vectors",
             Pass::GatherScalars => "gather_scalars",
         }
@@ -238,7 +226,6 @@ impl Pass {
     fn slots(self) -> &'static [Slot] {
         use Slot::*;
         match self {
-            Pass::Impulse => &[Params, Positions, Velocities],
             Pass::Predict => &[Params, Positions, Velocities, Predicted],
             Pass::Bin => &[Params, Predicted, Cells],
             Pass::Count => &[Params, Cells, GridCount],
@@ -301,8 +288,7 @@ impl Pass {
                 Stats,
                 Top,
             ],
-            Pass::Reduce | Pass::ReduceNearest => &[Level, Stats],
-            Pass::RayHits => &[Params, Positions, Stats],
+            Pass::Reduce => &[Level, Stats],
             Pass::GatherVectors => &[Params, Sorted, Vectors, Scratch],
             Pass::GatherScalars => &[Params, Sorted, Scalars, Gathered],
         }
@@ -505,14 +491,6 @@ impl Buffers {
     }
 }
 
-/// A push or pull from the mouse, waiting for the next step.
-#[derive(Clone, Copy)]
-struct Impulse {
-    center: Vec3,
-    radius: f32,
-    strength: f32,
-}
-
 /// The title readout, measured on the GPU from the last step's state.
 #[derive(Clone, Copy, Debug)]
 pub struct Readout {
@@ -542,7 +520,6 @@ pub struct GpuFluid {
     stepped: bool,
     /// Largest neighbourhood seen since the last upload, capped or not.
     max_neighbors: u32,
-    impulses: Vec<Impulse>,
     /// Bumped whenever the particle buffers are replaced, so bind groups made
     /// elsewhere know to follow.
     revision: u64,
@@ -589,7 +566,6 @@ impl GpuFluid {
             generation: 0,
             stepped: false,
             max_neighbors: 0,
-            impulses: Vec::new(),
             revision: 0,
         };
         solver.bind();
@@ -874,7 +850,6 @@ impl GpuFluid {
         }
         self.generation = fluid.generation;
         self.stepped = false;
-        self.impulses.clear();
     }
 
     /// Uploads `fluid` if it has been reset since the GPU last saw it. Stepping
@@ -884,15 +859,6 @@ impl GpuFluid {
         if fluid.generation != self.generation || fluid.len().max(1) != self.buffers.n {
             self.upload(fluid);
         }
-    }
-
-    /// Queues the mouse push of [`Fluid::apply_radial_impulse`] for the next step.
-    pub fn apply_radial_impulse(&mut self, center: Vec3, radius: f32, strength: f32) {
-        self.impulses.push(Impulse {
-            center,
-            radius,
-            strength,
-        });
     }
 
     /// Advances the fluid by `dt` seconds, exactly as [`Fluid::step`] does, and
@@ -907,22 +873,10 @@ impl GpuFluid {
         let substeps = fluid.params.substeps.max(1);
         let sub_dt = dt / substeps as f32;
 
-        // The CPU applies these straight to the velocities between steps; the
-        // positions they read are the same ones this step starts from.
-        for impulse in std::mem::take(&mut self.impulses) {
-            self.write_params(fluid, sub_dt, fluid.elapsed, Some(impulse), Vec3::ZERO);
-            let mut encoder = self.encoder();
-            {
-                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-                self.run(&mut pass, Pass::Impulse, n);
-            }
-            self.gpu.queue.submit([encoder.finish()]);
-        }
-
         let mut encoder = self.encoder();
         self.since_renumber += 1;
         if self.stepped && self.since_renumber >= RENUMBER_EVERY {
-            self.write_params(fluid, sub_dt, fluid.elapsed, None, Vec3::ZERO);
+            self.write_params(fluid, sub_dt, fluid.elapsed);
             self.encode_renumber(&mut encoder);
             self.since_renumber = 0;
         }
@@ -931,12 +885,12 @@ impl GpuFluid {
             fluid.elapsed += sub_dt;
             // Written per submission: a queued write lands before the commands
             // submitted with it, so each substep needs its own.
-            self.write_params(fluid, sub_dt, fluid.elapsed, None, Vec3::ZERO);
+            self.write_params(fluid, sub_dt, fluid.elapsed);
             self.encode_substep(&mut encoder, fluid.params.iterations);
             self.gpu.queue.submit([encoder.finish()]);
             encoder = self.encoder();
         }
-        self.write_params(fluid, dt, fluid.elapsed, None, Vec3::ZERO);
+        self.write_params(fluid, dt, fluid.elapsed);
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
             self.run(&mut pass, Pass::Foam, n);
@@ -1071,7 +1025,7 @@ impl GpuFluid {
             return None;
         }
         let b = &self.buffers;
-        self.write_params(fluid, 0.0, fluid.elapsed, None, Vec3::ZERO);
+        self.write_params(fluid, 0.0, fluid.elapsed);
         let last = 16 * (b.reduce_size as u64 - 1);
         let mut encoder = self.encoder();
         {
@@ -1098,37 +1052,6 @@ impl GpuFluid {
             },
             peak_speed,
         })
-    }
-
-    /// [`Fluid::nearest_along_ray`], over the particles on the GPU.
-    pub fn nearest_along_ray(
-        &self,
-        fluid: &Fluid,
-        origin: Vec3,
-        direction: Vec3,
-        radius: f32,
-    ) -> Option<Vec3> {
-        let direction = direction.normalize_or_zero();
-        if direction == Vec3::ZERO {
-            return None;
-        }
-        let b = &self.buffers;
-        let ray = Impulse {
-            center: origin,
-            radius,
-            strength: 0.0,
-        };
-        self.write_params(fluid, 0.0, fluid.elapsed, Some(ray), direction);
-        let mut encoder = self.encoder();
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-            self.run(&mut pass, Pass::RayHits, b.reduce_size);
-            self.run_levels(&mut pass, Pass::ReduceNearest);
-        }
-        encoder.copy_buffer_to_buffer(&b.stats, 16 * (b.reduce_size as u64 - 1), &b.probe, 0, 16);
-        self.gpu.queue.submit([encoder.finish()]);
-        let [x, y, z, along] = self.gpu.read(&b.probe, |bytes| cast::<[f32; 4]>(bytes)[0]);
-        (along > -3.0e38).then_some(Vec3::new(x, y, z))
     }
 
     /// The largest neighbourhood seen since the last upload. The GPU solver
@@ -1180,7 +1103,7 @@ impl GpuFluid {
         }
     }
 
-    fn write_params(&self, fluid: &Fluid, dt: f32, time: f32, impulse: Option<Impulse>, ray: Vec3) {
+    fn write_params(&self, fluid: &Fluid, dt: f32, time: f32) {
         let b = &self.buffers;
         let p = &fluid.params;
         let bounds = p.bounds;
@@ -1205,11 +1128,6 @@ impl GpuFluid {
         let wave = fluid.wave.unwrap_or_default();
         let maker = fluid.wavemaker;
         let from = |v: Vec3| v.extend(0.0).to_array();
-        let impulse = impulse.unwrap_or(Impulse {
-            center: Vec3::ZERO,
-            radius: 0.0,
-            strength: 0.0,
-        });
         let params = GpuParams {
             bounds_min: from(bounds.min),
             bounds_max: from(bounds.max),
@@ -1219,8 +1137,6 @@ impl GpuFluid {
             gravity: from(p.gravity),
             grid_origin: bounds.min.extend(p.smoothing_radius).to_array(),
             direction: from(maker.map_or(Vec3::X, |m| m.direction)),
-            impulse: impulse.center.extend(impulse.radius).to_array(),
-            ray: from(ray),
             n: b.n as u32,
             capacity: b.capacity,
             dims_x: b.dims[0],
@@ -1247,7 +1163,6 @@ impl GpuFluid {
             viscosity: p.viscosity,
             speed_scale: (p.gravity.length() * p.spacing).sqrt().max(1.0),
             interior_scale: 1.0 / (4.0 / 3.0 * PI * k.h.powi(3)) / (1.0 / p.spacing.powi(3)),
-            strength: impulse.strength,
             reef_height: wave.reef_height,
             reef_start: wave.reef_start,
             reef_width: wave.reef_width,
@@ -1262,7 +1177,7 @@ impl GpuFluid {
             period: maker.map_or(1.0, |m| m.period),
             beach_start: maker.map_or(0.0, |m| m.beach_start),
             beach_width: maker.map_or(1.0, |m| m.beach_width),
-            _pad: [0.0; 3],
+            _pad: [0.0; 4],
         };
         self.gpu
             .queue
@@ -1342,7 +1257,7 @@ mod tests {
             self.gpu
                 .queue
                 .write_buffer(&b.predicted, 0, bytemuck::cast_slice(&packed));
-            self.write_params(fluid, 0.0, 0.0, None, Vec3::ZERO);
+            self.write_params(fluid, 0.0, 0.0);
             let mut encoder = self.encoder();
             self.rebuild_grid(&mut encoder, &b.grid);
             {
@@ -1474,8 +1389,8 @@ mod tests {
     }
 
     /// Every term, from the same state: the dam break's artificial pressure and
-    /// walls, plus a mouse push; the swell's wavemaker, ramped up; the slab's
-    /// reef, solid support and beach.
+    /// walls; the swell's wavemaker, ramped up; the slab's reef, solid support
+    /// and beach.
     #[test]
     fn one_step_matches_the_cpu() {
         let Some(gpu) = device() else { return };
@@ -1497,11 +1412,6 @@ mod tests {
             let mut twin = fresh(&config);
             copy_state(&cpu, &mut twin);
             let mut solver = GpuFluid::new(gpu.clone(), &twin);
-            if name == "dam break" {
-                let center = cpu.pos[cpu.len() / 2];
-                cpu.apply_radial_impulse(center, 110.0, 400.0);
-                solver.apply_radial_impulse(center, 110.0, 400.0);
-            }
             cpu.step(1.0 / 60.0);
             solver.step_back(&mut twin, 1.0 / 60.0);
 
@@ -1862,7 +1772,7 @@ mod tests {
         let rounds = 5;
         for _ in 0..rounds {
             fluid.elapsed += 1.0 / 60.0;
-            solver.write_params(&fluid, 1.0 / 60.0, fluid.elapsed, None, Vec3::ZERO);
+            solver.write_params(&fluid, 1.0 / 60.0, fluid.elapsed);
             let mut encoder = solver.encoder();
             for (k, (_, which)) in phases.iter().enumerate() {
                 let timestamps = |k: usize| wgpu::ComputePassTimestampWrites {

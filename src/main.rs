@@ -3,15 +3,15 @@
 //! Everything tunable lives in `config.toml`; see `config.rs` for the fields
 //! and their defaults. Pass a different path as the first argument.
 //!
-//! Controls, with the fluid on the left button as it was in 2D:
-//!   left mouse    push the water away from the cursor
-//!   shift + left  pull the water towards the cursor
-//!   right drag    orbit the camera
-//!   scroll        zoom
+//! Controls. The water is only watched; nothing pushes it:
+//!   mouse drag    look around
+//!   W A S D       fly forward, left, back, right (or the arrow keys)
+//!   Q / E         fly down / up
+//!   shift         fly faster
 //!   space         pause / resume
 //!   R             replay the current scene
 //!   G             flip gravity
-//!   S             normal / slow playback
+//!   T             normal / slow playback
 //!   P / B         particle view / tank bounds
 //!   F12           screenshot
 
@@ -31,7 +31,7 @@ use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PresentMode, PrimaryWindow};
 
-use camera::{OrbitCamera, OrbitCameraPlugin};
+use camera::FlyCameraPlugin;
 use config::Config;
 use gpu::Gpu;
 use render::FluidRenderPlugin;
@@ -226,7 +226,7 @@ fn main() {
     .init_resource::<Paused>()
     .init_resource::<HudTimer>()
     .init_resource::<Timings>()
-    .add_plugins((OrbitCameraPlugin, FluidRenderPlugin))
+    .add_plugins((FlyCameraPlugin, FluidRenderPlugin))
     .add_systems(Startup, start_gpu_solver)
     .add_systems(FixedUpdate, step_fluid.run_if(running))
     .add_systems(
@@ -234,7 +234,6 @@ fn main() {
         (
             handle_keys,
             sync_gpu_fluid.after(handle_keys),
-            handle_mouse.run_if(running),
             update_title,
             playback_clock,
         ),
@@ -335,69 +334,13 @@ fn handle_keys(
     if keys.just_pressed(KeyCode::KeyG) {
         fluid.params.gravity = -fluid.params.gravity;
     }
-    if keys.just_pressed(KeyCode::KeyS) {
+    // Not S, which flies the camera backwards.
+    if keys.just_pressed(KeyCode::KeyT) {
         playback.scale = if playback.scale < 0.99 {
             1.0
         } else {
             config.scene.time_scale.min(0.25)
         };
-    }
-}
-
-/// Pushes or pulls the water at the cursor, on the left button as in 2D.
-///
-/// The depth comes from the fluid: the impulse lands on the frontmost water
-/// under the cursor. Falling back to a plane through the camera's focus point
-/// keeps a drag going when the cursor slides off the water mid-stroke, instead
-/// of the push cutting out.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Bevy injects resources as independent system parameters"
-)]
-fn handle_mouse(
-    buttons: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
-    window: Single<&Window, With<PrimaryWindow>>,
-    camera: Single<(&Camera, &GlobalTransform, &OrbitCamera)>,
-    config: Res<Config>,
-    time: Res<Time>,
-    mut fluid: ResMut<Fluid>,
-    gpu: Option<ResMut<GpuFluid>>,
-) {
-    if !buttons.pressed(MouseButton::Left) {
-        return;
-    }
-    let Some(cursor) = window.cursor_position() else {
-        return;
-    };
-    let (camera, camera_transform, orbit) = *camera;
-    let Ok(ray) = camera.viewport_to_world(camera_transform, cursor) else {
-        return;
-    };
-
-    let reach = config.input.mouse_radius;
-    // With the GPU solving, only the GPU knows where the particles are.
-    let hit = match gpu.as_ref() {
-        Some(gpu) => gpu.nearest_along_ray(&fluid, ray.origin, *ray.direction, reach),
-        None => fluid.nearest_along_ray(ray.origin, *ray.direction, reach),
-    };
-    let point = match hit {
-        Some(hit) => hit,
-        None => {
-            let plane = InfinitePlane3d::new(camera_transform.forward());
-            let Some(distance) = ray.intersect_plane(orbit.target, plane) else {
-                return;
-            };
-            ray.get_point(distance)
-        }
-    };
-
-    let pull = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    // Scaled by frame time so the push feels the same regardless of frame rate.
-    let strength = config.input.mouse_strength * time.delta_secs() * if pull { -1.0 } else { 1.0 };
-    match gpu {
-        Some(mut gpu) => gpu.apply_radial_impulse(point, config.input.mouse_radius, strength),
-        None => fluid.apply_radial_impulse(point, config.input.mouse_radius, strength),
     }
 }
 
@@ -441,7 +384,7 @@ fn update_title(
         "n/a".to_string()
     };
     window.title = format!(
-        "{} | {:.2}s / {:.2}x | {} particles | {:.1} ms ({:.1} {} solve + {:.1} surface) | compression {:.1}% | bulk {bulk} | peak {:.0}{} | SPACE pause · R replay · S speed · P particles · B bounds",
+        "{} | {:.2}s / {:.2}x | {} particles | {:.1} ms ({:.1} {} solve + {:.1} surface) | compression {:.1}% | bulk {bulk} | peak {:.0}{} | drag look · WASD/QE fly · SPACE pause · R replay · T speed · P particles · B bounds",
         if fluid.wave.is_some() {
             "Swell / reef break"
         } else {

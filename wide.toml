@@ -58,7 +58,3 @@ deep_color = [0.015, 0.16, 0.20]
 mid_color = [0.08, 0.58, 0.53]
 foam_color = [0.92, 0.98, 1.00]
 vsync = true
-
-[input]
-mouse_radius = 110.0
-mouse_strength = 10000.0

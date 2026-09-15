@@ -1,6 +1,6 @@
 # One big wave, plunging along a wide crest over a shallow reef. Run with
 # `cargo run --release -- slab.toml`. The lip throws about 8 simulated seconds
-# in and peels across the crest within a second; S slows playback for it. This
+# in and peels across the crest within a second; T slows playback for it. This
 # costs far more than config.toml: about 29 ms per solver step on an M4 Pro's
 # GPU, 170 on its CPU, so the break takes about 18 seconds to arrive on the GPU
 # and a minute and a half on the CPU. For a video, see the capture section of
@@ -108,7 +108,3 @@ deep_color = [0.015, 0.16, 0.20]
 mid_color = [0.08, 0.58, 0.53]
 foam_color = [0.92, 0.98, 1.00]
 vsync = true
-
-[input]
-mouse_radius = 110.0
-mouse_strength = 1300.0

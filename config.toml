@@ -11,7 +11,7 @@
 [scene]
 scenario = "wave"
 time_scale = 1.0
-# Let successive swells travel to the reef. R restarts; S slows playback.
+# Let successive swells travel to the reef. R restarts; T slows playback.
 replay_after = 0.0
 # Allow about 35 simulated seconds for the first wave to break: the generator
 # settles for one period and ramps over two more (24s at this period), and
@@ -73,8 +73,8 @@ beach_width = 0.19
 #
 # Against real gravity this preset is 0.109 m per world unit: a 100-metre,
 # 8-second, 11-metre swell breaking over a 3-metre shelf. For a meter-based
-# setup, use gravity = [0, -9.81, 0] and rescale all lengths, particle spacing,
-# and input settings consistently.
+# setup, use gravity = [0, -9.81, 0] and rescale all lengths and particle
+# spacing consistently.
 width = 1400.0
 height = 720.0
 depth = 140.0
@@ -200,21 +200,3 @@ foam_color = [0.92, 0.98, 1.00]
 # Cap the frame rate to the display. Turn it off to see what a frame actually
 # costs: with it on, the title's ms/frame just reads your refresh interval.
 vsync = true
-
-[input]
-# Radius of the mouse's influence, in world units, and the velocity change per
-# second at its centre.
-#
-# A radial push in an incompressible fluid is mostly cancelled by the density
-# constraint -- only the free surface is free to move -- so the strength is far
-# larger than the speeds it produces. Measured at the original 700 gravity,
-# held at a 110 radius:
-#
-#    4000 -> peak  604 u/s, surface lifts 13 units
-#   10000 -> peak  ~900 u/s
-#   30000 -> peak 1984 u/s
-#
-# Radius follows the spacing and strength is an acceleration, so it follows
-# gravity: both are scaled from those numbers rather than re-measured.
-mouse_radius = 190.0
-mouse_strength = 1300.0

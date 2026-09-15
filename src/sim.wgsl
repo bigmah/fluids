@@ -33,10 +33,6 @@ struct Params {
     gravity: vec4<f32>,
     grid_origin: vec4<f32>,
     direction: vec4<f32>,
-    // The mouse. xyz centre (or ray origin), w radius.
-    impulse: vec4<f32>,
-    // xyz direction of the mouse ray.
-    ray: vec4<f32>,
     n: u32,
     capacity: u32,
     dims_x: i32,
@@ -63,7 +59,6 @@ struct Params {
     viscosity: f32,
     speed_scale: f32,
     interior_scale: f32,
-    strength: f32,
     reef_height: f32,
     reef_start: f32,
     reef_width: f32,
@@ -81,6 +76,7 @@ struct Params {
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
+    _pad3: f32,
 }
 
 // One level of a parallel prefix sum or reduction: pairs `stride` apart, `count`
@@ -294,25 +290,6 @@ fn solid_support(p: vec3<f32>) -> vec4<f32> {
     out += half_space(hi.z - p.z, vec3<f32>(0.0, 0.0, -1.0));
     out += half_space(hi.y - p.y, vec3<f32>(0.0, -1.0, 0.0));
     return out;
-}
-
-// ---------------------------------------------------------------------------
-// The mouse
-// ---------------------------------------------------------------------------
-
-@compute @workgroup_size(256)
-fn apply_impulse(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = invocation(id);
-    if i >= params.n {
-        return;
-    }
-    let offset = positions[i].xyz - params.impulse.xyz;
-    let d2 = dot(offset, offset);
-    let r2 = params.impulse.w * params.impulse.w;
-    if d2 < r2 && d2 > 1e-6 {
-        let falloff = 1.0 - d2 / r2;
-        velocities[i] += vec4<f32>(normalize(offset) * (params.strength * falloff), 0.0);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,39 +707,4 @@ fn reduce(@builtin(global_invocation_id) id: vec3<u32>) {
     let a = stats[left];
     let b = stats[right];
     stats[right] = vec4<f32>(a.xyz + b.xyz, max(a.w, b.w));
-}
-
-// The frontmost particle within `impulse.w` of the mouse ray, as
-// `Fluid::nearest_along_ray`: xyz position, w minus its distance along the ray.
-@compute @workgroup_size(256)
-fn ray_hits(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = invocation(id);
-    if i >= params.reduce_size {
-        return;
-    }
-    stats[i] = vec4<f32>(0.0, 0.0, 0.0, LOWEST);
-    if i >= params.n {
-        return;
-    }
-    let rel = positions[i].xyz - params.impulse.xyz;
-    let along = dot(rel, params.ray.xyz);
-    if along <= 0.0 {
-        return;
-    }
-    if dot(rel, rel) - along * along < params.impulse.w * params.impulse.w {
-        stats[i] = vec4<f32>(positions[i].xyz, -along);
-    }
-}
-
-@compute @workgroup_size(256)
-fn reduce_nearest(@builtin(global_invocation_id) id: vec3<u32>) {
-    let k = invocation(id);
-    if k >= level.count {
-        return;
-    }
-    let left = k * 2u * level.stride + level.stride - 1u;
-    let right = left + level.stride;
-    if stats[left].w > stats[right].w {
-        stats[right] = stats[left];
-    }
 }

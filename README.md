@@ -41,7 +41,7 @@ The water settles for one period and the generator ramps up over two more.
 Allow roughly 35 simulated seconds for the shipped swell to reach the shelf: the
 ramp is 24 of them at this period, and deep-water swell carries its energy at
 half the speed of its crests.
-Playback starts at normal speed with automatic replay disabled; `S` slows the
+Playback starts at normal speed with automatic replay disabled; `T` slows the
 simulation for inspection and `R` restarts it.
 
 Lengths use the same arbitrary world units as the original solver, and period
@@ -49,8 +49,8 @@ uses simulation seconds. The shipped gravity is 700 units/s². Longer periods
 need a deeper and wider offshore region: validation requires at least half a
 wavelength of water depth, resolved wave height/wavelength, and space between
 the generation zone, reef, and damping beach. For a meter-based setup, set
-`world.gravity = [0, -9.81, 0]` and choose all lengths, particle spacing, and input
-settings consistently. Playback speed does not change the physical period.
+`world.gravity = [0, -9.81, 0]` and choose all lengths and particle spacing
+consistently. Playback speed does not change the physical period.
 
 How big the wave can be is not a free choice. Water cannot hold a wave steeper
 than about `height / wavelength = 1/7`, and wavelength is not a field: it comes
@@ -177,29 +177,21 @@ argument: `cargo run --release -- big.toml`.
 
 | | |
 |---|---|
-| left mouse | push the water away from the cursor |
-| shift + left mouse | pull the water towards the cursor |
-| right drag | orbit the camera |
-| scroll | zoom |
+| mouse drag | look around (either button) |
+| `W` `A` `S` `D` or arrow keys | fly forward, left, back, right |
+| `Q` / `E` | fly down / up |
+| shift | fly faster |
 | space | pause / resume |
 | `R` | replay the current scene, clearing foam and restoring gravity |
 | `G` | flip gravity |
-| `S` | toggle normal speed / slow motion |
+| `T` | toggle normal speed / slow motion |
 | `P` | toggle water surface / particle diagnostic |
 | `B` | toggle tank bounds |
 | `F12` | save a screenshot in the working directory |
 
-The fluid is on the left button, as it was in the 2D version; the camera took
-the right one. A screen position names a ray rather than a point, so the push
-gets its depth from the fluid itself — it lands on the frontmost water under the
-cursor, which is what makes it feel direct rather than like pushing an invisible
-plane floating in the tank.
-
-Expect it to feel firmer than the 2D version did. A radial push in an
-incompressible fluid is mostly cancelled by the density constraint — only the
-free surface is really free to move — and in 3D there is more water in every
-direction to resist it. `input.mouse_strength` is the knob, and `config.toml`
-carries the measured response curve.
+The simulation is only watched: nothing reaches into the water. The camera
+starts on the break and flies where it looks, at a pace sized to the tank, and
+keeps real time, so it moves at full speed in slow motion.
 
 The window title shows simulation time and speed, particle count, frame/solver/
 surface timings, compression, bulk density, and peak particle speed.
@@ -283,9 +275,9 @@ them into the density grid, writes the water shader's volume texture, and runs
 marching tetrahedra straight into the water mesh's vertex buffer; `spray.wgsl`
 writes the spray droplets into another mesh the same way. Extraction sits after
 the frame's solver steps and before anything draws it, so the render thread can
-never draw a surface built from a later step. The mouse ray and the title's
-compression, bulk density and peak speed are queried from the GPU too, as a
-parallel reduction that reads back one value.
+never draw a surface built from a later step. The title's compression, bulk
+density and peak speed are queried from the GPU too, as a parallel reduction
+that reads back one value.
 
 Three details decide whether the GPU agrees with the CPU at all:
 
@@ -427,7 +419,7 @@ shallower than its rest volume implies.
 | `src/spray_gpu.rs`, `src/spray.wgsl` | spray and the particle diagnostic, written into a mesh on the GPU |
 | `src/render.rs` | surface/volume uploads or GPU rebuilds, reef, spray, diagnostic view |
 | `src/water.wgsl` | water absorption, reflections, light transmission, foam |
-| `src/camera.rs` | orbit camera |
+| `src/camera.rs` | fly camera |
 | `src/main.rs` | app wiring, input, window title readout |
 
 The solver knows nothing about TOML: `Config` is the file format, and
@@ -461,8 +453,6 @@ can be wrong in ways that still compile and still produce plausible motion:
 - `settles_into_a_flat_pool` — the dam break runs out to every wall and levels
   off, sampled on both sides.
 - `the_bulk_holds_its_rest_density` — measured geometrically, see above.
-- `radial_impulse_pushes_out_and_pulls_in` — the mouse force, which is otherwise
-  only reachable by hand.
 - `reconstructed_water_is_closed_with_outward_normals` — watertight mesh edges,
   outward winding, unit normals, and a reasonable reconstructed volume.
 - `dispersion_sets_wavelength_from_period_and_depth` — the prescribed period
@@ -487,7 +477,7 @@ note, on a machine with no GPU adapter:
 - `neighbour_search_matches_the_cpu_exactly` — from identical positions, the GPU
   grid and neighbour lists equal the CPU's, order included.
 - `one_step_matches_the_cpu` — from the same state, one step agrees in position,
-  velocity, foam and spray on the dam break (with a mouse push), the swell flume
+  velocity, foam and spray on the dam break, the swell flume
   mid-generation and the slab flume, and the GPU readouts agree with the CPU's.
 - `the_slab_flume_matches_the_cpu_through_the_break` — a GPU step from the CPU's
   exact state agrees every half second through the break, and a free GPU run

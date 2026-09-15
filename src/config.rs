@@ -42,7 +42,6 @@ pub struct Config {
     pub fluid: FluidBlock,
     pub solver: Solver,
     pub render: Render,
-    pub input: Input,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -175,21 +174,6 @@ pub struct Render {
     pub vsync: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Input {
-    pub mouse_radius: f32,
-    /// Velocity change per second at the centre of the mouse's influence.
-    ///
-    /// A radial push in an incompressible fluid is mostly cancelled by the
-    /// density constraint -- only the free surface can actually move -- so this
-    /// is much larger than the speeds it produces. Measured: a held push at
-    /// 10000 peaks near 900 units/s. Pushing far past that is self-defeating,
-    /// since a particle crossing more than a kernel radius per step outruns its
-    /// own neighbour list; raise `solver.substeps` if you want a harder shove.
-    pub mouse_strength: f32,
-}
-
 impl Default for World {
     fn default() -> Self {
         Self {
@@ -243,15 +227,6 @@ impl Default for Render {
             mid_color: [0.08, 0.58, 0.53],
             foam_color: [0.92, 0.98, 1.00],
             vsync: true,
-        }
-    }
-}
-
-impl Default for Input {
-    fn default() -> Self {
-        Self {
-            mouse_radius: 110.0,
-            mouse_strength: 10000.0,
         }
     }
 }
