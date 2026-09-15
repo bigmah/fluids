@@ -1,7 +1,7 @@
 //! Spray and the particle diagnostic, built on the GPU from the particles a
 //! [`GpuFluid`] keeps there, straight into a mesh's vertex buffer. The CPU
 //! solver draws the same thing as one entity per particle, which at
-//! `slab.toml`'s 1.3 million particles is more than the ECS wants to carry.
+//! `slab.toml`'s 930,000 particles is more than the ECS wants to carry.
 
 use crate::gpu::{Binding, Kernel, cast};
 use crate::sim_gpu::{GpuFluid, GpuScan, dispatch, staging_buffer, storage_buffer};

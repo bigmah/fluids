@@ -78,16 +78,23 @@ tank's proportions a deep-water wave barely shoals before it reaches the shelf,
 so it arrives already as steep as it can be and has nowhere to go. `slab.toml`
 sends a single solitary wave instead (`swell.waves = 1`) — one crest with no
 trough, the long-period limit of a swell — up a long 1:8 reef slope. It starts
-offshore already travelling, from the first-order Boussinesq solution, so there
-is no generation zone and no period. Whether it plunges follows Grilli et al.
+already travelling, from the first-order Boussinesq solution, so there is no
+generation zone and no period. Whether it plunges follows Grilli et al.
 (1997): plunging for `0.025 < 1.521 · slope / sqrt(height / depth) < 0.3`, with
 spilling below and a collapsing bore above. The preset sits at 0.25; the same
-wave on a 1:5 slope (0.39) collapses without a lip. The lip throws about 13
+wave on a 1:5 slope (0.39) collapses without a lip. The lip throws about 8
 simulated seconds in, first at the far wall: the reef is skewed slightly, so the
-barrel peels across the 1200-unit crest toward the camera. It is about 1.3
-million particles: a solver step takes about 40 ms on an M4 Pro's GPU and 230 on
-its CPU, so the break takes about half a minute to arrive on the GPU; `world.depth = 200` is the same break
-across a narrow strip at a sixth of the cost.
+barrel peels across the 1200-unit crest toward the camera.
+
+The crest starts at the foot of the reef, with only the half of the wave behind
+it on flat water. Starting the whole wave on flat water spent five simulated
+seconds and a third of the particles carrying it there, and changed the break
+very little: across the full crest the lip throws at 8.0 s rather than 12.9, and
+33 units past the top of the reef rather than 46 to 62. It is about
+930,000 particles: a solver step takes about 29 ms on an M4 Pro's GPU and 170 on
+its CPU, so the break arrives about 18 seconds after launch on the GPU, against
+38 before; `world.depth = 200` is the same break across a narrow strip at a
+sixth of the cost.
 
 For the original short-period swell across a much wider crest:
 
@@ -320,12 +327,12 @@ for a solver step and `surface_cost` for rebuilding the surface, CPU against GPU
 |---|---|---|---|
 | `config.toml` | 22,078 | 11.8 → 3 ms | 3.5 → 2.9 ms |
 | `wide.toml` | 68,909 | 30.5 → 4.5 ms | 13.6 → 4.9 ms |
-| `slab.toml` | 1,306,995 | 231 → 38 ms | 80 → 18 ms |
+| `slab.toml` | 934,665 | 168 → 28 ms | 62 → 17 ms |
 
 A small tank is mostly fixed cost on the GPU — dozens of dispatches and a wait
 per step — so the gain grows with the particle count. The CPU renderer also
-uploads the rebuilt mesh every frame, a million triangles at `slab.toml`'s scale,
-and draws its spray as a million entities; with the GPU backend neither leaves
+uploads the rebuilt mesh every frame, 800,000 triangles at `slab.toml`'s scale,
+and draws its spray as 900,000 entities; with the GPU backend neither leaves
 the GPU. Three quarters of a GPU step is the Jacobi iterations (`profile_phases`
 breaks it down), so `solver.iterations` is the knob that moves it, and
 `solver.chebyshev` is what lets it come down without losing accuracy.
@@ -432,7 +439,7 @@ selects the reef wave tank. Both configurations have physical regression tests.
 The main water surface is one mesh/material. With the CPU solver, spray and the
 particle diagnostic share a small sphere mesh and material so they can be
 instanced; with the GPU solver they are one mesh of small octahedra written in
-place, since a million entities is more than the ECS wants to carry. Past
+place, since 900,000 entities is more than the ECS wants to carry. Past
 131,072 particles the diagnostic view shows an even sample of them. The shaders
 are embedded in the executable; no external art assets are needed.
 
@@ -469,8 +476,8 @@ can be wrong in ways that still compile and still produce plausible motion:
   simulated time at normal and quarter speed.
 - `coherent_translation_does_not_generate_foam` — speed alone does not whiten water.
 - `a_single_wave_plunges_over_the_reef` — `slab.toml` in a narrow flume starts
-  whole and offshore, then overturns with air under the lip over the reef,
-  before the beach.
+  at full height with its crest short of the reef, then overturns with air under
+  the lip over the reef, before the beach.
 - `a_single_wave_is_validated_on_its_own_terms` — the swell's period and
   wavelength limits do not apply to a single wave, but its own do.
 
@@ -484,7 +491,7 @@ note, on a machine with no GPU adapter:
   mid-generation and the slab flume, and the GPU readouts agree with the CPU's.
 - `the_slab_flume_matches_the_cpu_through_the_break` — a GPU step from the CPU's
   exact state agrees every half second through the break, and a free GPU run
-  throws its lip within half a second of the CPU's (13.1 against 13.0 s).
+  throws its lip within half a second of the CPU's (7.9 against 8.0 s).
 - `gpu_runs_repeat_exactly` — bit-identical replays, including after a reset.
 - `renumbering_keeps_every_particle_its_own` — a step taken after the particles
   are shuffled into grid order agrees, particle for particle, with one taken
@@ -512,7 +519,7 @@ simulation's own speed however slowly the machine renders it. The break in
 `slab.toml`, at quarter speed:
 
 ```
-FLUIDS_CAPTURE_PATH=/tmp/slab FLUIDS_CAPTURE_AT=12 FLUIDS_CAPTURE_UNTIL=14.5 \
+FLUIDS_CAPTURE_PATH=/tmp/slab FLUIDS_CAPTURE_AT=7 FLUIDS_CAPTURE_UNTIL=9.5 \
   FLUIDS_CAPTURE_FPS=60 cargo run --release -- slab.toml
 ffmpeg -framerate 15 -i /tmp/slab/frame-%05d.png -vf scale=1280:-2,format=yuv420p slab.mp4
 ```

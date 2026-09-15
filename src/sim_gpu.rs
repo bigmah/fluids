@@ -1959,7 +1959,7 @@ mod tests {
     /// Chebyshev acceleration: how far still water sinks in four seconds,
     /// compression and bulk density mid-run, when and where the lip throws, how
     /// far the surface half a second before that sits from the most-iterated
-    /// plain run's, and speed and compression through the splash to 20 s.
+    /// plain run's, and speed and compression through the splash to 15 s.
     /// Ignored; `cargo test --release iteration_accuracy -- --ignored --nocapture`.
     ///
     /// `FLUIDS_VARIANTS=16,8:0.9,6:0.95:2` chooses the runs, each
@@ -2057,25 +2057,25 @@ mod tests {
             let mut solver = GpuFluid::new(gpu.clone(), &fluid);
             let (mut mid, mut lip, mut before) = (None, None, Vec::new());
             let (mut splash, mut late) = (0.0f32, Vec::new());
-            for step in 1..=20 * 60 {
+            for step in 1..=15 * 60 {
                 solver.step(&mut fluid, dt);
                 if step % 6 != 0 {
                     continue;
                 }
                 let readout = solver.readout(&fluid).unwrap();
-                if step == 10 * 60 {
+                if step == 5 * 60 {
                     mid = Some(readout);
                 }
                 solver.download(&mut fluid);
-                if step == 12 * 60 + 30 {
+                if step == 7 * 60 + 30 {
                     before = surface(&fluid);
                 }
-                if step == 16 * 60 || step == 20 * 60 {
+                if step == 11 * 60 || step == 15 * 60 {
                     late.push((rms(&fluid), readout.compression));
                 }
                 if lip.is_some() {
                     splash = splash.max(readout.peak_speed);
-                } else if step > 12 * 60 + 30 {
+                } else if step > 7 * 60 + 30 {
                     let thrown: Vec<_> = overturned_columns(&fluid, config.wave)
                         .into_iter()
                         .filter(|x| *x > reef)
@@ -2117,8 +2117,8 @@ mod tests {
             "lip x",
             "gap (d)",
             "splash",
-            "rms 16/20",
-            "comp 16/20"
+            "rms 11/15",
+            "comp 11/15"
         );
         for run in runs {
             let gap = reference.as_ref().map_or(f32::NAN, |reference| {

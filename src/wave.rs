@@ -133,8 +133,11 @@ impl Wave {
         let skew = self.reef_skew.abs() * bounds.size().z * 0.5;
         let offshore = self.reef_start * bounds.size().x - skew;
         if let Some(single) = Solitary::new(*self, swell, bounds, -gravity.y) {
-            // No period and no generation zone: the wave starts whole, in flat
-            // water, and only has to fit there and hold together.
+            // No period and no generation zone: the wave starts already
+            // travelling, and only has to fit and hold together. Its crest
+            // starts half its width from the offshore wall, so the half behind
+            // is always in the tank. The half in front may start over the foot
+            // of the reef, but the crest has to start in flat water all along.
             if swell.direction != 0.0 {
                 return Err("a single wave travels straight at the reef: set swell.direction = 0 and angle the break with wave.reef_skew".into());
             }
@@ -144,11 +147,10 @@ impl Wave {
                     0.7 * self.water_depth
                 ));
             }
-            let room = 2.0 * single.half_width() + 4.0 * spacing;
-            if offshore < room {
+            if offshore < single.half_width() {
                 return Err(format!(
-                    "wave.reef_start must leave {:.0} units of flat water for the single wave to start in; increase world.width or reef_start, or lower swell.height",
-                    room + skew
+                    "wave.reef_start must leave {:.0} units of flat water for the single wave's crest to start in; increase world.width or reef_start, or lower swell.height",
+                    single.half_width() + skew
                 ));
             }
         } else {
@@ -230,8 +232,8 @@ impl Wave {
 }
 
 /// One solitary wave: a single crest with no trough, the long-period limit of
-/// a swell. Unlike the swell it is not generated; reset places it offshore
-/// already travelling, from the first-order Boussinesq solution for height H in
+/// a swell. Unlike the swell it is not generated; reset places it already
+/// travelling, from the first-order Boussinesq solution for height H in
 /// depth h:  eta = H sech^2(K (x - x0)),  K = sqrt(3H / 4h^3),  c = sqrt(g (h + H)).
 ///
 /// Whether it plunges is set by the reef slope s against its relative height:
@@ -676,7 +678,7 @@ pub(crate) mod tests {
         let mut f = Fluid::new(c.fluid_params());
         c.reset_fluid(&mut f);
 
-        // It starts whole: offshore, at full height, and already moving in.
+        // It starts at full height, its crest short of the reef, already moving in.
         let crest = f
             .pos
             .iter()
@@ -684,7 +686,7 @@ pub(crate) mod tests {
             .max_by(|a, b| a.y.total_cmp(&b.y))
             .unwrap();
         assert!(crest.y > level + c.swell.height - d, "crest at {crest}");
-        assert!(f.pos.iter().all(|p| p.x < reef || p.y < level + d));
+        assert!(crest.x < reef, "crest at {crest}, reef at {reef}");
         assert!(
             f.vel
                 .iter()
@@ -735,7 +737,7 @@ pub(crate) mod tests {
         tall.world.height = 2.0 * c.world.height;
         assert!(tall.validate().unwrap_err().contains("0.7"));
         let mut cramped = c.clone();
-        cramped.wave.reef_start = 0.3;
+        cramped.wave.reef_start = 0.2;
         assert!(cramped.validate().unwrap_err().contains("flat water"));
         // The same file with the swell back on is held to the swell's limits.
         let mut swell = c;
