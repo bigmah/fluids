@@ -96,8 +96,9 @@ struct Level {
 @group(0) @binding(2) var<storage, read_write> positions: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> velocities: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> predicted: array<vec4<f32>>;
-@group(0) @binding(6) var<storage, read_write> lambdas: array<f32>;
-@group(0) @binding(7) var<storage, read_write> deltas: array<vec4<f32>>;
+// xyz: the positions λ was computed at; w: λ. A neighbour's position and
+// multiplier are then one load, not two; see `solve_delta`.
+@group(0) @binding(6) var<storage, read_write> lambdas: array<vec4<f32>>;
 // xyz: gradient of the solid's kernel volume; w: the volume itself.
 @group(0) @binding(8) var<storage, read_write> boundary: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read_write> scratch: array<vec4<f32>>;
@@ -505,7 +506,8 @@ fn solve_lambda(@builtin(global_invocation_id) id: vec3<u32>) {
     var grad_self = support.xyz;
     var sum_sq = 0.0;
     let base = i * params.capacity;
-    for (var m = 0u; m < neighbor_count[i]; m++) {
+    let count = neighbor_count[i];
+    for (var m = 0u; m < count; m++) {
         let r = pi - predicted[neighbors[base + m]].xyz;
         rho += poly6(dot(r, r));
         let g = spiky_grad(r) * params.inv_rho0;
@@ -515,26 +517,32 @@ fn solve_lambda(@builtin(global_invocation_id) id: vec3<u32>) {
     sum_sq += dot(grad_self, grad_self);
     let c = rho * params.inv_rho0 + support.w - 1.0;
     boundary[i] = support;
-    if has(CLAMP) && c <= 0.0 {
-        lambdas[i] = 0.0;
-    } else {
-        lambdas[i] = -c / (sum_sq + params.epsilon);
+    var lambda = 0.0;
+    if !(has(CLAMP) && c <= 0.0) {
+        lambda = -c / (sum_sq + params.epsilon);
     }
+    lambdas[i] = vec4<f32>(pi, lambda);
 }
 
+// The correction, and `sim.rs`'s third loop, which applies it, in one pass. It
+// reads the positions `solve_lambda` copied out alongside each multiplier and
+// writes `predicted`, so no invocation reads what another writes. The loop is
+// bound by memory rather than arithmetic: reading a neighbour's multiplier from
+// a buffer of its own cost more than the whole kernel evaluation.
 @compute @workgroup_size(256)
 fn solve_delta(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = invocation(id);
     if i >= params.n {
         return;
     }
-    let pi = predicted[i].xyz;
-    let li = lambdas[i];
+    let pi = lambdas[i].xyz;
+    let li = lambdas[i].w;
     var d = vec3<f32>(0.0);
     let base = i * params.capacity;
-    for (var m = 0u; m < neighbor_count[i]; m++) {
-        let j = neighbors[base + m];
-        let r = pi - predicted[j].xyz;
+    let count = neighbor_count[i];
+    for (var m = 0u; m < count; m++) {
+        let pj = lambdas[neighbors[base + m]];
+        let r = pi - pj.xyz;
         // With artificial pressure off the term is -0, which changes no sum, so
         // the wave presets skip its kernel and power entirely.
         var s_corr = 0.0;
@@ -542,18 +550,10 @@ fn solve_delta(@builtin(global_invocation_id) id: vec3<u32>) {
             let ratio = poly6(dot(r, r)) / params.tensile_w;
             s_corr = -params.tensile_scale * powi(ratio, params.tensile_n);
         }
-        d += spiky_grad(r) * (li + lambdas[j] + s_corr);
+        d += spiky_grad(r) * (li + pj.w + s_corr);
     }
-    deltas[i] = vec4<f32>((d * params.inv_rho0 + boundary[i].xyz * li) * params.relax, 0.0);
-}
-
-@compute @workgroup_size(256)
-fn apply_delta(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = invocation(id);
-    if i >= params.n {
-        return;
-    }
-    var p = clamp(predicted[i].xyz + deltas[i].xyz, params.wall_min.xyz, params.wall_max.xyz);
+    let delta = (d * params.inv_rho0 + boundary[i].xyz * li) * params.relax;
+    var p = clamp(pi + delta, params.wall_min.xyz, params.wall_max.xyz);
     if has(WAVE) {
         p = project(p);
     }

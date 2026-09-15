@@ -85,8 +85,8 @@ spilling below and a collapsing bore above. The preset sits at 0.25; the same
 wave on a 1:5 slope (0.39) collapses without a lip. The lip throws about 13
 simulated seconds in, first at the far wall: the reef is skewed slightly, so the
 barrel peels across the 1200-unit crest toward the camera. It is about 1.3
-million particles: a solver step takes about 80 ms on an M4 Pro's GPU and 400 on
-its CPU, so the break takes about a minute to arrive on the GPU; `world.depth = 200` is the same break
+million particles: a solver step takes about 60 ms on an M4 Pro's GPU and 400 on
+its CPU, so the break takes under a minute to arrive on the GPU; `world.depth = 200` is the same break
 across a narrow strip at a sixth of the cost.
 
 For the original short-period swell across a much wider crest:
@@ -308,16 +308,24 @@ for a solver step and `surface_cost` for rebuilding the surface, CPU against GPU
 |---|---|---|---|
 | `config.toml` | 22,078 | 11.8 → 3 ms | 3.5 → 2.9 ms |
 | `wide.toml` | 68,909 | 30.5 → 4.5 ms | 13.6 → 4.9 ms |
-| `slab.toml` | 1,306,995 | 385 → 75 ms | 80 → 18 ms |
+| `slab.toml` | 1,306,995 | 385 → 60 ms | 80 → 18 ms |
 
 A small tank is mostly fixed cost on the GPU — dozens of dispatches and a wait
 per step — so the gain grows with the particle count. The CPU renderer also
 uploads the rebuilt mesh every frame, a million triangles at `slab.toml`'s scale,
 and draws its spray as a million entities; with the GPU backend neither leaves
 the GPU. In the app, `slab.toml` reaches 17 simulated seconds in 90 seconds of
-wall-clock time on the GPU, against 2 on the CPU. Nine tenths of a GPU step is
+wall-clock time on the GPU, against 2 on the CPU. Four fifths of a GPU step is
 the Jacobi iterations (`profile_phases` breaks it down), so `solver.iterations`
 is the knob that moves it.
+
+Those iterations are bound by memory, not arithmetic. Dropping the solid-support
+maths or the artificial-pressure branch from them saves nothing measurable, but
+each neighbour's multiplier used to be a load from a buffer of its own, and that
+load cost more than the kernels. So `solve_lambda` writes each multiplier beside
+the position it was computed at, and `solve_delta` reads both in one load and
+applies its correction in the same pass, taking a `slab.toml` step from 73 ms
+to 60.
 
 ## Turning the particle count up
 

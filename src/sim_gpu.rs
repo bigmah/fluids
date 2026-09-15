@@ -118,7 +118,6 @@ enum Slot {
     Velocities = 4,
     Predicted = 5,
     Lambdas = 6,
-    Deltas = 7,
     Boundary = 8,
     Scratch = 9,
     Foam = 10,
@@ -151,7 +150,6 @@ enum Pass {
     Neighbors,
     Lambda,
     Delta,
-    ApplyDelta,
     Velocity,
     Viscosity,
     Foam,
@@ -165,7 +163,7 @@ enum Pass {
 }
 
 impl Pass {
-    const ALL: [Pass; 21] = [
+    const ALL: [Pass; 20] = [
         Pass::Impulse,
         Pass::Predict,
         Pass::Bin,
@@ -176,7 +174,6 @@ impl Pass {
         Pass::Neighbors,
         Pass::Lambda,
         Pass::Delta,
-        Pass::ApplyDelta,
         Pass::Velocity,
         Pass::Viscosity,
         Pass::Foam,
@@ -210,7 +207,6 @@ impl Pass {
             Pass::Neighbors => "find_neighbors",
             Pass::Lambda => "solve_lambda",
             Pass::Delta => "solve_delta",
-            Pass::ApplyDelta => "apply_delta",
             Pass::Velocity => "update_velocity",
             Pass::Viscosity => "apply_viscosity",
             Pass::Foam => "update_foam",
@@ -248,19 +244,17 @@ impl Pass {
                 Predicted,
                 Neighbors,
                 NeighborCount,
-                Lambdas,
                 Boundary,
+                Lambdas,
             ],
             Pass::Delta => &[
                 Params,
                 Predicted,
                 Neighbors,
                 NeighborCount,
-                Lambdas,
                 Boundary,
-                Deltas,
+                Lambdas,
             ],
-            Pass::ApplyDelta => &[Params, Predicted, Deltas],
             Pass::Velocity => &[Params, Predicted, Positions, Velocities],
             Pass::Viscosity => &[
                 Params,
@@ -437,7 +431,6 @@ struct Buffers {
     velocities: Buffer,
     predicted: Buffer,
     lambdas: Buffer,
-    deltas: Buffer,
     boundary: Buffer,
     scratch: Buffer,
     foam: Buffer,
@@ -466,7 +459,6 @@ impl Buffers {
             Slot::Velocities => self.velocities.as_entire_binding(),
             Slot::Predicted => self.predicted.as_entire_binding(),
             Slot::Lambdas => self.lambdas.as_entire_binding(),
-            Slot::Deltas => self.deltas.as_entire_binding(),
             Slot::Boundary => self.boundary.as_entire_binding(),
             Slot::Scratch => self.scratch.as_entire_binding(),
             Slot::Foam => self.foam.as_entire_binding(),
@@ -601,8 +593,7 @@ impl GpuFluid {
             previous: storage_buffer(gpu, "previous positions", 16 * n64),
             velocities: storage_buffer(gpu, "velocities", 16 * n64),
             predicted,
-            lambdas: storage_buffer(gpu, "lambdas", 4 * n64),
-            deltas: storage_buffer(gpu, "deltas", 16 * n64),
+            lambdas: storage_buffer(gpu, "lambdas", 16 * n64),
             boundary: storage_buffer(gpu, "boundary support", 16 * n64),
             scratch: storage_buffer(gpu, "velocity scratch", 16 * n64),
             foam: storage_buffer(gpu, "foam", 4 * n64),
@@ -967,7 +958,6 @@ impl GpuFluid {
             for _ in 0..iterations {
                 self.run(&mut pass, Pass::Lambda, n);
                 self.run(&mut pass, Pass::Delta, n);
-                self.run(&mut pass, Pass::ApplyDelta, n);
             }
             // 4. Velocity, 5. viscosity.
             self.run(&mut pass, Pass::Velocity, n);
@@ -1761,7 +1751,6 @@ mod tests {
         for _ in 0..iterations {
             phases.push(("lambda", Some(Pass::Lambda)));
             phases.push(("delta", Some(Pass::Delta)));
-            phases.push(("apply delta", Some(Pass::ApplyDelta)));
         }
         phases.push(("velocity", Some(Pass::Velocity)));
         phases.push(("viscosity", Some(Pass::Viscosity)));
